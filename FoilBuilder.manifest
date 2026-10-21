@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "462ef10c-bbbf-4d5d-9d5b-15dda4638788",
+  "author": "aQuaFoil (Queen's University)",
+  "description": {
+    "": "Build parametric hydrofoil T-foil lifting surfaces (main foil with flap, rudder foil with curved anhedral) from airfoil .dat files."
+  },
+  "version": "0.1.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
