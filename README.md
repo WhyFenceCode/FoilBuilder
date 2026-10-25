@@ -4,68 +4,135 @@ tags: [aquafoil, fusion, cad, hydrofoil, tool]
 created: 2026-10-19
 ---
 
-# FoilBuilder (Fusion add-in) v0.3
+# FoilBuilder (Fusion add-in) v0.4
 
-Builds a hydrofoil lifting surface natively in Fusion from any airfoil `.dat` file, or from several `.dat` / `.csv` airfoils placed along the span and blended between them:
-- **Main foil**: bi-elliptical planform, with a flap split on a straight hinge line.
-- **Rudder foil**: same planform, with curved ("banana") anhedral.
-- Optional blended bulb at the centreline.
-- Optional vertical support (strut): a straight, separate piece that slots into a cutout in the top of the foil/bulb.
+FoilBuilder builds a hydrofoil lifting surface natively in Fusion from airfoil coordinate files. It creates the construction planes, sketches, fitted splines, lofts and splits itself, so the result is ordinary Fusion geometry with no external CAD libraries.
 
-The add-in creates the construction planes, sketches, fitted splines, loft and split in Fusion, so the geometry is Fusion's own B-rep (no Python CAD libraries).
+What it can build:
+- **Main foil**: bi-elliptical planform, optionally with a flap split along a straight hinge line.
+- **Rudder foil**: the same planform with curved ("banana") anhedral.
+- **Varying section** (optional): several airfoils placed along the span, with the section blended between them.
+- **Blended bulb** (optional): a bulb at the centreline.
+- **Vertical support** (optional): a straight, separate strut that slots into a cutout in the top of the foil or bulb. The foil can rise in a smooth collar round it.
 
-> [!warning] First version, not yet run inside Fusion
-> The geometry maths (`foilgeom.py`) is tested: it reproduces the CadQuery Bonetti models exactly and reads Selig and Lednicer `.dat` files. The Fusion API calls have been checked for logic and plane/point consistency against a mock, but **not in a live Fusion session**. If something fails, the error dialog shows a traceback. Send it over and it can be fixed quickly.
+> [!note] Status
+> The geometry maths in `foilgeom.py` is tested on its own: it reproduces the CadQuery Bonetti models and reads Selig and Lednicer files. The Fusion side has been run in Fusion during development, but the newest parts (the vertical's blend in particular) have had little use there. If a build fails, the error dialog shows a traceback. Send it over and it can be fixed quickly.
 
 ## Install
-1. Copy the whole `FoilBuilder` folder somewhere permanent. Keep the folder name, `FoilBuilder.py` and `FoilBuilder.manifest` together.
-2. In Fusion: **Utilities → Add-Ins → Scripts and Add-Ins** (Shift+S) → **Add-Ins** tab → **+** (or the green plus), then select the `FoilBuilder` folder.
-3. Select it and click **Run** (tick *Run on Startup* if you like).
-4. Three buttons appear in **Solid → Create**: **Foil from .dat**, **Foil from .dat by section** and **Rebuild Foil**.
 
-## Use
-1. **Foil from .dat** opens a dialog:
-   - **Browse...** to pick a `.dat` file (`airfoils/` has `e393.dat` and `NACA66-012.dat`). The info line shows the section's t/c and camber.
-   - **Preset**: *Bonetti main foil* or *Bonetti rudder foil*, or set values by hand.
-   - **Planform:** span (mm), area (cm²), Δ (ellipse axis position from the TE, fraction of root chord). The root chord is computed as 4A/(πb).
-   - **Flap:** on/off, flap chord / root chord, minimum flap chord where the flap ends.
-   - **Curved anhedral:** tip drop (0 = flat) and the ellipse vertical semi-axis.
-   - **Bulb (blended):** on/off, length at the centreline, share of the extra length ahead of the LE, max thickness, and the spanwise half-width over which it blends into the wing. With a flap, the flap is split into port and starboard halves around the bulb.
-   - **Vertical support:** off by default. Tick it to add a vertical (strut) on the centreline, then pick its airfoil `.dat` / `.csv` (chord along x, thickness spanwise) and set:
-     - **Chord** and **LE aft of foil nose**: chordwise position, measured from the foil's nose on the centreline (the bulb nose when there is a bulb).
-     - **Top height above chord line**: the vertical is straight, with the same section all the way from the slot bottom to a flat top face at this height, measured from the foil chord line at the centreline. Extrude from that face to lengthen it.
-     - **Slot depth into foil**: the vertical reaches this far below the lowest point of the foil top under it, ending in a flat bottom. The same shape is cut out of the foil as the slot, so the vertical drops in and can be screwed from below. Screw holes aren't modelled.
-     - **Slot rim round**: a small round on the edge of the cutout where the vertical enters the foil (default 1 mm, 0 = sharp). If Fusion can't make it, the foil is still built with a sharp rim, and the message says so.
-     - The vertical's section is closed with a tiny rounded TE (at least 0.5 mm thick), so the slot rim has no sharp corners.
-     - The info line shows the vertical's thickness and how much foil is left under the slot (at least 2 mm). If it doesn't fit (slot too deep, vertical outside the foil chord, slot overlapping the flap, or top below the foil), the reason is shown and **OK** stays disabled.
-   - **Advanced:** sections per half span, tip cut, TE thickness, vertical axis (Y up by default, or Z up), replace previous foil.
-2. Click **OK**. The bodies are `foil`, or `main element` + `flap`, plus a separate `vertical` body when the support is on, and their features are grouped in the timeline as **"FoilBuilder: Foil …"**.
-   - In **Assembly** (or classic) documents the foil goes in its own component **"Foil …"**.
-   - In **Part Design** documents (only one component allowed) it's built directly in the part.
-3. **Foil from .dat by section** is the same dialog, but the section can change along the span:
-   - **Add...** picks one or more `.dat` / `.csv` files (Selig or Lednicer layout; a CSV is `x,y` per row, a header line is fine). Each file becomes a row with its position **η** = fraction of the semi-span (0 = centreline, 1 = tip), mirrored to both sides. Picking several files into an empty table spreads them evenly from root to tip; edit η in the table.
-   - **Remove** deletes the selected row (or the last one).
-   - Every airfoil is resampled onto the same cosine-spaced x stations, and each span station gets a linear blend of the two neighbouring rows. Inboard of the first row / outboard of the last, that row's airfoil is used unchanged. A section is placed exactly at each row's η.
-   - The **Vertical support** group gets its own section table. Here η is the height fraction, from the highest point of the foil top under the vertical (0) to its flat top (1). The tenon uses the η = 0 section.
-   - The file list and positions are stored in the design, so **Rebuild Foil** rebuilds by section too. Running plain **Foil from .dat** switches the design back to a single section.
-4. All values are saved as **user parameters** (`foil_span`, `foil_area_cm2`, `foil_delta`, …). To change the design: **Modify → Change Parameters**, edit the values, then click **Rebuild Foil**. The previous foil component is replaced.
+1. Copy the whole `FoilBuilder` folder somewhere permanent. Keep `FoilBuilder.py`, `foilgeom.py` and `FoilBuilder.manifest` together in a folder named `FoilBuilder`.
+2. In Fusion, open **Utilities → Add-Ins → Scripts and Add-Ins** (Shift+S), go to the **Add-Ins** tab, click **+** and select the `FoilBuilder` folder.
+3. Select it and click **Run**. Tick *Run on Startup* if you want it every time.
+4. Three buttons appear under **Solid → Create**: **Foil from .dat**, **Foil from .dat by section** and **Rebuild Foil**.
+
+After updating the files, **Stop** and **Run** the add-in again so Fusion picks up the changes.
+
+## Building a foil
+
+**Foil from .dat** opens a dialog. The info line at the bottom summarises the result as you change values. If something can't be built, it gives the reason and **OK** stays disabled.
+
+### Airfoil and preset
+- **Browse...**: pick the airfoil (`.dat` or `.csv`, Selig or Lednicer layout). A CSV is `x,y` per row, and a header line is fine. `airfoils/` contains `e393.dat` and `NACA66-012.dat`. The info line shows the section's t/c and camber.
+- **Preset**: *Bonetti main foil* or *Bonetti rudder foil* fill in the planform, flap, anhedral, bulb and advanced values. Choose *(keep current values)* to set them by hand. Presets don't touch the vertical support settings.
+
+### Planform
+- **Span** (mm) and **Area** (cm²). The root chord follows as 4A/(πb).
+- **Δ axis from TE**: where the ellipse axis sits, as a fraction of the root chord measured from the trailing edge.
+
+### Flap
+- **Split flap** on/off, **Flap / root chord**, and **Flap min chord**: the flap ends where its chord drops below this.
+- With a bulb, the flap is split into port and starboard halves round it.
+
+### Curved anhedral
+- **Tip drop** (0 = flat) and the **Ellipse semi-axis**, the vertical semi-axis of the ellipse the span line follows.
+
+### Bulb (blended)
+- On/off, **Length at centreline**, **Share of extra length ahead of LE**, **Max thickness**, and **Blend half-width**: how far either side of the centreline the bulb blends into the wing.
+
+### Vertical support
+Off by default. Tick **Vertical support** to add a vertical (strut) on the centreline. It is its own straight body, with the same section from bottom to top, and slots into a matching cutout in the foil. It can then be screwed in from below; screw holes aren't modelled.
+
+- **Browse...**: the vertical's airfoil, with chord along x and thickness across the span. Its trailing edge is rounded off at no less than 0.5 mm thick, so the cutout has no sharp corners.
+- **Chord** (default 80 mm).
+- **LE aft of foil nose** (default 25 mm): measured on the centreline from the foil's nose, which is the bulb nose when there's a bulb. Negative values put the LE ahead of the nose. The vertical can sit anywhere along the foil, even overhanging its nose or tail. Where it overhangs, its bottom is trimmed level with that end of the foil, so nothing hangs below.
+- **Top height above chord line** (default 150 mm): height of the vertical's flat top face, measured from the foil's chord line at the centreline. Extrude that face to lengthen the vertical.
+- **Slot depth into foil** (default 5 mm): the vertical's bottom, and the cutout, follow the foil's top surface this far down, always leaving at least 2 mm of foil underneath. Where the foil is too thin for that, the vertical simply sits on the surface. If the vertical overhangs a blunt bulb nose or tail, the last few mm can leave less than 2 mm, because the trim drops to that end's height so there's no gap at the vertical's sides. The info line reports the actual minimum.
+- **Slot rim round** (default 1 mm, 0 = sharp; only without the blend): rounds the edge of the cutout. If Fusion can't make the round, the foil is still built with a sharp rim and the message says so.
+
+The info line shows the vertical's thickness, the deepest point of the slot, the least foil left under it, and any overhang. The vertical can't be built if it isn't over the foil at all, if its slot would overlap the flap, or if its top is too low.
+
+### Blend into the vertical
+Off by default. Tick **Blend foil up into the vertical** and the foil rises in a collar round the vertical before the cutout is made. The flow then meets the vertical closer to its angle instead of at a sharp 90° corner. The collar is part of the foil body, and the vertical still drops into the slot as a separate piece.
+
+- **Blend height at the vertical** (default 3 mm): how far the collar stands above the foil where it meets the vertical. The rim follows the foil's top.
+- **Blend width at the sides** (default 6 mm): how far out from the vertical's sides the collar reaches.
+- **Blend length ahead of the vertical** and **behind the vertical** (default 6 mm each): how far the collar reaches forward of the vertical's nose and aft of its tail. Lengthen them for a longer, gentler ramp. They apply straight ahead and behind and taper smoothly into the side width, giving a teardrop shape. It gets a little wider than the sides just round the ends.
+- **Blend angle at vertical** (default 25°): the collar's angle where it meets the vertical, measured from vertical. Smaller is closer to tangent. 0 would leave a knife edge at the rim.
+
+The blend never blocks a build. It fades out smoothly where the foil gets thin (towards a nose or tail, or where the vertical overhangs) and before the flap.
+
+How it's built: FoilBuilder works out the collar shape itself and lofts it like a fillet. It doesn't use Fusion's fillet tool, which can't handle this joint. The slices are cut at right angles to the vertical's wall all the way round it, fanning out round its nose and tail. Each has the same make-up and the same number of evenly spaced points, which keeps the surface smooth. Each slice reaches 1.2 mm under the foil's surface, and the collar meets the foil 8° off tangent. Both make the join a clean overlap rather than two surfaces just touching, which is what Fusion handles reliably. That hidden part is never visible, and where the collar fades out its surface sits 0.3 mm under the foil's.
+
+### Advanced
+- **Sections per half**: span stations on each side.
+- **Tip cut**: the last station, as a fraction of the semi-span.
+- **TE thickness**: trailing-edge thickness as % of local chord.
+- **Vertical axis**: Y up (default) or Z up. See [Coordinate system](#coordinate-system).
+- **Replace previous foil**: delete the previous FoilBuilder foil before building.
+
+### The result
+- **Bodies**: `foil`, or `main element` plus `flap` (`flap port` / `flap starboard` with a bulb). With the support on there is also a `vertical` body.
+- **Timeline**: the features are grouped as **"FoilBuilder: Foil …"**.
+- **Assembly** (or classic) documents: the foil goes in its own component, **"Foil …"**.
+- **Part Design** documents (one component only): it's built directly in the part.
+
+## Building by section
+
+**Foil from .dat by section** is the same dialog, but the airfoil can change along the span. In place of the single file picker there is a table with one row per airfoil.
+
+- **Add...**: pick one or more `.dat` / `.csv` files. Each becomes a row with its position **η**, the fraction of the semi-span (0 = centreline, 1 = tip), mirrored to both sides. Several files added to an empty table are spread evenly from root to tip; edit η in the table.
+- **Remove selected (or last)**: deletes the selected row, or the last row if none is selected.
+- **Blending**: every airfoil is resampled onto the same chordwise stations, and each span station gets a linear blend of its two neighbouring rows. Inboard of the first row and outboard of the last, that row's airfoil is used unchanged. A station is placed exactly at each row's η.
+- **Vertical sections**: the Vertical support group gets its own table. There η is height, from the highest point of the foil top under the vertical (0) to the vertical's flat top (1). Everything below η = 0 uses the η = 0 section.
+
+## Changing a design: the parameter table
+
+Every dialog value is saved in the design as a Fusion **user parameter** with a `foil_` prefix. Values you can change there:
+
+| Group | Parameters |
+|---|---|
+| Planform | `foil_span`, `foil_area_cm2`, `foil_delta` |
+| Flap | `foil_flap_on`, `foil_flap_frac`, `foil_flap_min_chord` |
+| Anhedral | `foil_anhedral_depth`, `foil_anhedral_semiaxis` |
+| Advanced | `foil_n_half`, `foil_tip_eta`, `foil_te_thick_pct` |
+| Bulb | `foil_bulb_on`, `foil_bulb_length`, `foil_bulb_nose_frac`, `foil_bulb_thickness`, `foil_bulb_half_width` |
+| Vertical | `foil_strut_on`, `foil_strut_chord`, `foil_strut_le_x`, `foil_strut_height`, `foil_strut_slot_depth`, `foil_strut_rim_round` |
+| Blend | `foil_blend_on`, `foil_blend_height`, `foil_blend_width`, `foil_blend_front_width`, `foil_blend_back_width`, `foil_blend_wall_angle` |
+
+On/off values are `1` or `0`. The airfoil files and their η positions, and the vertical axis, are stored in the design too, but not as parameters. To change those, run the dialog again.
+
+To edit:
+1. Open the table: **Solid → Modify → Change Parameters** (the *fx* icon). The `foil_` values are listed under **User Parameters**.
+2. Change values in the **Expression** column and click **OK**.
+3. Click **Rebuild Foil** (Solid → Create). It replaces the previous foil with one built from the new values.
 
 > [!note] Why "Rebuild" rather than live parameters
-> A spline loaded from a `.dat` can't be tied to Fusion parameter expressions, so changing a parameter can't update the loft by itself. Rebuild Foil regenerates the geometry from the parameters in one click. Anything you model *on top* of the foil (bulb, strut, fillets) should go in a separate component, because it won't survive a rebuild.
+> A spline loaded from a coordinate file can't be tied to Fusion parameter expressions, so changing a parameter can't update the loft by itself. Rebuild Foil regenerates everything in one click. Anything you model yourself on top of the foil (fittings, extra fillets, an extension of the vertical) should go in a separate component, because a rebuild doesn't keep it.
 
 ## Coordinate system
-- Default (Y up): model X aft (chordwise), Y up, span along -Z. With Z up selected: X aft, Y spanwise, Z up.
-- The choice is stored in the design, so Rebuild Foil keeps it; designs built before with Z up stay Z up until you pick Y in the dialog.
-- Origin: on the planform's ellipse axis at the centreline.
-- Foil incidence is 0°. Set it at assembly (strut incidence / rudder rake).
+- **Y up** (default): model X points aft (chordwise), Y is up, and the span runs along −Z.
+- **Z up**: X aft, Y spanwise, Z up.
+- The choice is stored in the design, so Rebuild Foil keeps it. A design built with Z up stays Z up until you pick Y in the dialog.
+- The origin is on the planform's ellipse axis at the centreline, on the chord line.
+- The foil is built at 0° incidence. Set incidence at assembly (strut incidence or rudder rake).
 
 ## Files
 | File | Purpose |
 |---|---|
-| `FoilBuilder.py` | Fusion add-in (UI, Fusion geometry calls) |
-| `foilgeom.py` | Pure-Python geometry core. Also usable outside Fusion (optimization scripts, checks) |
+| `FoilBuilder.py` | Fusion add-in: dialogs and Fusion geometry calls |
+| `foilgeom.py` | Pure-Python geometry core (planform, sections, vertical, blend). Also usable outside Fusion, e.g. in optimisation scripts or checks |
 | `FoilBuilder.manifest` | Add-in manifest |
 | `airfoils/` | Example sections |
 
 ## Extending
-New planform options go in `foilgeom.Planform` (e.g. chord at N stations, twist, sweep), and the Fusion side doesn't change. Because the same `foilgeom.py` can run in the optimization loop, the optimizer and the CAD always describe the same geometry.
+New planform options (chord at N stations, twist, sweep) go in `foilgeom.Planform`, and the Fusion side doesn't need to change. Because the same `foilgeom.py` can run inside an optimisation loop, the optimiser and the CAD always describe the same geometry.

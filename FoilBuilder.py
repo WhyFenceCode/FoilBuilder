@@ -64,9 +64,15 @@ PARAMS = [
     ("foil_strut_le_x", "strut_le_x", "mm", "Vertical LE aft of the foil nose on the centreline"),
     ("foil_strut_height", "strut_height", "mm", "Height of the vertical's flat top above the foil chord line"),
     ("foil_strut_rim_round", "strut_rim_round", "mm", "Round on the slot rim where the vertical enters the foil (0 = sharp)"),
-    ("foil_strut_slot_depth", "strut_slot_depth", "mm", "Slot depth below the lowest foil-top point under the vertical"),
+    ("foil_strut_slot_depth", "strut_slot_depth", "mm", "Slot depth below the foil top (at least 2 mm of foil is left under it)"),
+    ("foil_blend_on", "blend_on", "", "1 = foil rises in a collar round the vertical, 0 = flat slot"),
+    ("foil_blend_height", "blend_height", "mm", "Collar height above the foil top at the vertical"),
+    ("foil_blend_width", "blend_width", "mm", "How far out from the vertical's sides the collar reaches"),
+    ("foil_blend_front_width", "blend_front_width", "mm", "How far ahead of the vertical the collar reaches"),
+    ("foil_blend_back_width", "blend_back_width", "mm", "How far behind the vertical the collar reaches"),
+    ("foil_blend_wall_angle", "blend_wall_angle", "", "Collar angle at the vertical, deg from vertical (0 = tangent)"),
 ]
-BOOL_KEYS = ("flap_on", "bulb_on", "strut_on")
+BOOL_KEYS = ("flap_on", "bulb_on", "strut_on", "blend_on")
 
 _app = None
 _ui = None
@@ -261,7 +267,9 @@ def _prepare(p, foil_src, strut_src=None):
         if not strut_src:
             raise ValueError("Pick an airfoil file for the vertical")
         _, s_at, s_etas, s_afs = _airfoil_source(strut_src)
-        strut = (G.Strut(p, pf, af_for, s_afs), s_at, s_etas)
+        st = G.Strut(p, pf, af_for, s_afs)
+        blend = G.Blend(p, pf, af_for, st, s_at) if p.get("blend_on") else None
+        strut = (st, s_at, s_etas, blend)
     return name, pf, af_for, extra_eta, strut
 
 
@@ -317,6 +325,8 @@ def build_foil(p, foil_src, up_axis=DEFAULT_UP_AXIS, replace=True, strut_src=Non
     s = pf.summary()
     if strut:
         s.update(strut[0].summary())
+        if strut[3]:
+            s.update(strut[3].summary())
     s.update(notes)
     return af_name, s
 
@@ -344,12 +354,36 @@ def _section_profile(comp, plane, pts, P, name, smooth_te=False):
     return sk.profiles.item(0)
 
 
-def _loft(comp, profiles):
+def _lens_profile(comp, plane, upper, lower, P, name):
+    """Sketch on plane: upper spline (left to right), lower spline (right to
+    left), joined at both ends by lines. Returns its single profile."""
+    sk = _tag(comp.sketches.add(plane))
+    sk.name = name
+    sk.isComputeDeferred = True
+    splines = []
+    for pts in (upper, lower):
+        coll = adsk.core.ObjectCollection.create()
+        for (x, y, z) in pts:
+            coll.add(sk.modelToSketchSpace(P(x, y, z)))
+        splines.append(sk.sketchCurves.sketchFittedSplines.add(coll))
+    up, lo = splines
+    sk.sketchCurves.sketchLines.addByTwoPoints(up.endSketchPoint, lo.startSketchPoint)
+    sk.sketchCurves.sketchLines.addByTwoPoints(lo.endSketchPoint, up.startSketchPoint)
+    sk.isComputeDeferred = False
+    if sk.profiles.count != 1:
+        raise RuntimeError(f"{name} gave {sk.profiles.count} profiles")
+    sk.isVisible = False
+    adsk.doEvents()
+    return sk.profiles.item(0)
+
+
+def _loft(comp, profiles, closed=False):
     lofts = comp.features.loftFeatures
     li = lofts.createInput(adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
     for pr in profiles:
         li.loftSections.add(pr)
     li.isSolid = True
+    li.isClosed = closed
     return _tag(lofts.add(li)).bodies.item(0)
 
 
@@ -366,10 +400,11 @@ def _combine(comp, target, tool, op, keep_tool, feature=False):
 
 def _build_strut(comp, helper, foil, strut, P):
     """Vertical support: a straight loft from the slot bottom to its flat top,
-    kept as its own body. The same shape is cut out of the foil as the slot,
-    and the slot rim on the foil is optionally rounded.
-    Returns (slotted foil, vertical, notes)."""
-    st, af_at, etas = strut
+    kept as its own body. With a blend, a collar lofted from horizontal offset
+    sections is first joined to the foil. Then the vertical's shape is cut out
+    of the foil as the slot, and without a blend the slot rim is optionally
+    rounded. Returns (slotted foil, vertical, notes)."""
+    st, af_at, etas, blend = strut
     # One smooth closed loop per section (tiny rounded TE): a flat TE strip
     # would leave two sharp corners in the slot rim, which can't be rounded.
     profiles = []
@@ -378,17 +413,60 @@ def _build_strut(comp, helper, foil, strut, P):
         profiles.append(_section_profile(comp, plane, st.section(af_at(st.eta(z)), z), P,
                                          f"vertical z={z:.1f}", smooth_te=True))
     vert = _loft(comp, profiles)
+    ops = adsk.fusion.FeatureOperations
+    vert = _combine(comp, vert, _tenon_cutter(comp, helper, st, P), ops.CutFeatureOperation, False)
     vert.name = "vertical"
-    foil = _combine(comp, foil, vert, adsk.fusion.FeatureOperations.CutFeatureOperation, True)
-    foil.name = "foil"
 
     notes = {}
-    if st.rim > 0:
+    if blend:
+        runs = blend.runs()
+        for closed, slices in runs:
+            profiles = []
+            for k, (x, y, nx, ny, upper, lower) in enumerate(slices):
+                plane = _plane_through(comp, helper, P(x, y, 0.0), P(x + 10.0 * nx, y + 10.0 * ny, 0.0),
+                                       P(x, y, 10.0))
+                profiles.append(_lens_profile(comp, plane, upper, lower, P, f"blend slice {k}"))
+            foil = _combine(comp, foil, _loft(comp, profiles, closed), ops.JoinFeatureOperation, False)
+        if not runs:
+            notes["blend_skipped"] = "no foil round the vertical to blend into"
+    foil = _combine(comp, foil, vert, ops.CutFeatureOperation, True)
+    foil.name = "foil"
+
+    if st.rim > 0 and not blend:
         try:
             _round_slot_rim(comp, foil, st, P)
         except Exception as e:
             notes["rim_round_failed"] = f"{e}".splitlines()[0]
     return foil, vert, notes
+
+
+def _tenon_cutter(comp, helper, st, P):
+    """Body that trims the vertical's bottom to its tenon line: the line
+    (a spline in the centreline plane) down to below the vertical's loft,
+    extruded across the vertical's thickness."""
+    plane = _plane_through(comp, helper, P(0.0, 0.0, 0.0), P(10.0, 0.0, 0.0), P(0.0, 0.0, 10.0))
+    sk = _tag(comp.sketches.add(plane))
+    sk.name = "vertical tenon line"
+    sk.isComputeDeferred = True
+    coll = adsk.core.ObjectCollection.create()
+    for x, z in st.tenon_pts:
+        coll.add(sk.modelToSketchSpace(P(x, 0.0, z)))
+    spl = sk.sketchCurves.sketchFittedSplines.add(coll)
+    (x0, _), (x1, _) = st.tenon_pts[0], st.tenon_pts[-1]
+    zb = st.z_bot - 5.0
+    a, b = sk.modelToSketchSpace(P(x1, 0.0, zb)), sk.modelToSketchSpace(P(x0, 0.0, zb))
+    lines = sk.sketchCurves.sketchLines
+    l1 = lines.addByTwoPoints(spl.endSketchPoint, a)
+    l2 = lines.addByTwoPoints(l1.endSketchPoint, b)
+    lines.addByTwoPoints(l2.endSketchPoint, spl.startSketchPoint)
+    sk.isComputeDeferred = False
+    if sk.profiles.count != 1:
+        raise RuntimeError(f"Vertical tenon line gave {sk.profiles.count} profiles")
+    sk.isVisible = False
+    ext = comp.features.extrudeFeatures
+    ei = ext.createInput(sk.profiles.item(0), adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+    ei.setSymmetricExtent(adsk.core.ValueInput.createByReal(2.0 * (st.half_t + 5.0) * MM2CM), True)
+    return _tag(ext.add(ei)).bodies.item(0)
 
 
 def _round_slot_rim(comp, foil, st, P):
@@ -494,12 +572,20 @@ STRUT_SPINNERS = (
     ("strut_chord", "Chord (mm)", 10, 400, 1),
     ("strut_le_x", "LE aft of foil nose (mm)", -100, 400, 1),
     ("strut_height", "Top height above chord line (mm)", 10, 2000, 5),
-    ("strut_rim_round", "Slot rim round (mm, 0 = sharp)", 0, 10, 0.25),
     ("strut_slot_depth", "Slot depth into foil (mm)", 0.5, 50, 0.5),
+    ("strut_rim_round", "Slot rim round (mm, 0 = sharp; no blend)", 0, 10, 0.25),
+)
+# blend (collar) spinners, same layout
+BLEND_SPINNERS = (
+    ("blend_height", "Blend height at the vertical (mm)", 0.5, 30, 0.5),
+    ("blend_width", "Blend width at the sides (mm)", 1, 40, 0.5),
+    ("blend_front_width", "Blend length ahead of the vertical (mm)", 1, 120, 0.5),
+    ("blend_back_width", "Blend length behind the vertical (mm)", 1, 120, 0.5),
+    ("blend_wall_angle", "Blend angle at vertical (deg from vertical)", 0, 75, 1),
 )
 # inputs shown only while the vertical support is ticked
 STRUT_IDS = ("strut_help", "strut_table", "strut_add", "strut_remove", "strut_browse",
-             "strut_dat_path") + tuple(s[0] for s in STRUT_SPINNERS)
+             "strut_dat_path", "blend_on") + tuple(s[0] for s in STRUT_SPINNERS)
 # section table buttons -> table
 ADD_BUTTONS = {"sec_add": "sec_table", "strut_add": "strut_table"}
 REMOVE_BUTTONS = {"sec_remove": "sec_table", "strut_remove": "strut_table"}
@@ -550,11 +636,29 @@ def _check(inputs, by_section):
         strut = _prepare(p, foil_src, strut_src)[4]
         if strut:
             ss = strut[0].summary()
-            lines.append(f"Vertical {ss['strut_t']:.1f} mm thick, slot bottom at {ss['strut_z_bot']:.1f} mm, "
-                         f"{ss['strut_floor']:.1f} mm of foil left under the slot")
+            lines.append(_strut_line(ss))
+            if strut[3]:
+                lines.append(_blend_line(strut[3].summary()))
         return lines, None
     except Exception as e:
         return lines, str(e)
+
+
+def _strut_line(s):
+    """One line describing the vertical, from its summary."""
+    txt = (f"Vertical {s['strut_t']:.1f} mm thick, slot up to {s['strut_slot_max']:.1f} mm deep, "
+           f"at least {s['strut_floor']:.1f} mm of foil under it")
+    fwd, aft = s["strut_overhang_fwd"], s["strut_overhang_aft"]
+    if fwd > 0 or aft > 0:
+        txt += ", overhangs the foil " + " and ".join(
+            f"{v:.0f} mm {w}" for v, w in ((fwd, "ahead"), (aft, "behind")) if v > 0)
+    return txt
+
+
+def _blend_line(s):
+    return (f"Blend rises {s['blend_rise']:g} mm at the vertical, reaching {s['blend_width']:g} mm out at "
+            f"the sides, {s['blend_front_width']:g} mm ahead and {s['blend_back_width']:g} mm behind; "
+            "it fades out where the foil gets thin or near the flap")
 
 
 def _info_text(inputs, by_section=False):
@@ -574,8 +678,9 @@ def _params_from_inputs(inputs):
         tip_eta=g("tip_eta").value, te_thick_pct=g("te_thick_pct").value,
         bulb_on=g("bulb_on").value, bulb_length=g("bulb_length").value,
         bulb_nose_frac=g("bulb_nose_frac").value, bulb_thickness=g("bulb_thickness").value,
-        bulb_half_width=g("bulb_half_width").value, strut_on=g("strut_on").value)
-    for key, *_ in STRUT_SPINNERS:
+        bulb_half_width=g("bulb_half_width").value, strut_on=g("strut_on").value,
+        blend_on=g("blend_on").value)
+    for key, *_ in STRUT_SPINNERS + BLEND_SPINNERS:
         p[key] = g(key).value
     return p
 
@@ -592,10 +697,14 @@ def _set_inputs(inputs, p):
 
 def _show_strut(inputs):
     on = inputs.itemById("strut_on").value
-    for cid in STRUT_IDS:
+    blend = on and inputs.itemById("blend_on").value
+    shown = {cid: on for cid in STRUT_IDS}
+    shown.update({key: blend for key, *_ in BLEND_SPINNERS})
+    shown["strut_rim_round"] = on and not blend
+    for cid, vis in shown.items():
         it = inputs.itemById(cid)
         if it:
-            it.isVisible = on
+            it.isVisible = vis
 
 
 # ---- section tables (by-section dialog): one row per airfoil, [eta | file].
@@ -721,6 +830,11 @@ class BuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
             for key, label, lo, hi, step in STRUT_SPINNERS:
                 g.addFloatSpinnerCommandInput(key, label, "", lo, hi, step,
                                               float(p.get(key, G.DEFAULTS[key])))
+            g.addBoolValueInput("blend_on", "Blend foil up into the vertical", True, "",
+                                bool(p.get("blend_on", False)))
+            for key, label, lo, hi, step in BLEND_SPINNERS:
+                g.addFloatSpinnerCommandInput(key, label, "", lo, hi, step,
+                                              float(p.get(key, G.DEFAULTS[key])))
             _show_strut(inputs)
 
             g = inputs.addGroupCommandInput("g_adv", "Advanced").children
@@ -782,6 +896,8 @@ class BuildChangedHandler(adsk.core.InputChangedEventHandler):
                     tbl.deleteRow(r)
             elif changed.id == "strut_on":
                 _show_strut(inputs)
+            elif changed.id == "blend_on":
+                _show_strut(inputs)
             elif changed.id == "preset":
                 name = changed.selectedItem.name if changed.selectedItem else ""
                 if name in G.PRESETS:
@@ -806,8 +922,11 @@ class BuildValidateHandler(adsk.core.ValidateInputsEventHandler):
 def _built_message(name, s):
     msg = f"Built {name}: root chord {s['c_root']:.1f} mm, AR {s['AR']:.1f}."
     if "strut_floor" in s:
-        msg += (f"\nVertical: {s['strut_t']:.1f} mm thick, slot bottom at {s['strut_z_bot']:.1f} mm, "
-                f"{s['strut_floor']:.1f} mm of foil under the slot.")
+        msg += "\n" + _strut_line(s) + "."
+    if "blend_rise" in s:
+        msg += "\n" + _blend_line(s) + "."
+    if "blend_skipped" in s:
+        msg += f"\nNo blend was made: {s['blend_skipped']}."
     if "rim_round_failed" in s:
         msg += ("\nThe slot rim round was skipped (Fusion could not make it); the rim is sharp. "
                 f"Try a smaller rim round.\nFusion said: {s['rim_round_failed']}")
