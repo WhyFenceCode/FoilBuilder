@@ -4,11 +4,12 @@ tags: [aquafoil, fusion, cad, hydrofoil, tool]
 created: 2026-10-19
 ---
 
-# FoilBuilder (Fusion add-in) v0.2
+# FoilBuilder (Fusion add-in) v0.3
 
-Builds a hydrofoil lifting surface natively in Fusion from any airfoil `.dat` file:
+Builds a hydrofoil lifting surface natively in Fusion from any airfoil `.dat` file, or from several `.dat` / `.csv` airfoils placed along the span and blended between them:
 - **Main foil**: bi-elliptical planform, with a flap split on a straight hinge line.
 - **Rudder foil**: same planform, with curved ("banana") anhedral.
+- Optional blended bulb at the centreline.
 
 The add-in creates the construction planes, sketches, fitted splines, loft and split in Fusion, so the geometry is Fusion's own B-rep (no Python CAD libraries).
 
@@ -28,6 +29,7 @@ The add-in creates the construction planes, sketches, fitted splines, loft and s
    - **Planform:** span (mm), area (cm²), Δ (ellipse axis position from the TE, fraction of root chord). The root chord is computed as 4A/(πb).
    - **Flap:** on/off, flap chord / root chord, minimum flap chord where the flap ends.
    - **Curved anhedral:** tip drop (0 = flat) and the ellipse vertical semi-axis.
+   - **Bulb (blended):** on/off, length at the centreline, share of the extra length ahead of the LE, max thickness, and the spanwise half-width over which it blends into the wing. With a flap, the flap is split into port and starboard halves around the bulb.
    - **Advanced:** sections per half span, tip cut, TE thickness, vertical axis (Y up by default, or Z up), replace previous foil.
 2. Click **OK**. The bodies are `foil`, or `main element` + `flap`, and their features are grouped in the timeline as **"FoilBuilder: Foil …"**.
    - In **Assembly** (or classic) documents the foil goes in its own component **"Foil …"**.
