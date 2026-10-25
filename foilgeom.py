@@ -12,6 +12,8 @@ Anhedral (optional, "banana" foil): span line is an elliptical arc
 Sections are rotated about x to stay perpendicular to the span line.
 Flap (optional): straight hinge line at FLAP_FRAC * c_root ahead of the root
 TE, ending where the local flap chord drops to FLAP_MIN_CHORD.
+Sections (optional): SectionedAirfoil blends several airfoils placed at
+fractions of the semi-span, so the section shape can change along the span.
 """
 import math
 
@@ -119,6 +121,115 @@ def airfoil_stats(pts):
     return best_t[0], best_t[1], best_c[0], best_c[1]
 
 
+# ------------------------------------------------------------------ spanwise sections
+
+N_RESAMPLE = 50     # points per surface after resampling (cosine spaced)
+
+
+def _cubic_spline(xs, ys):
+    """Natural cubic spline through (xs, ys), xs strictly increasing. Returns f(x)."""
+    n = len(xs)
+    if n < 3:
+        return lambda x: _interp(x, xs, ys)
+    h = [xs[i + 1] - xs[i] for i in range(n - 1)]
+    a, b, c, d = [0.0] * n, [1.0] * n, [0.0] * n, [0.0] * n
+    for i in range(1, n - 1):
+        a[i], b[i], c[i] = h[i - 1], 2.0 * (h[i - 1] + h[i]), h[i]
+        d[i] = 6.0 * ((ys[i + 1] - ys[i]) / h[i] - (ys[i] - ys[i - 1]) / h[i - 1])
+    for i in range(1, n):                       # Thomas algorithm
+        w = a[i] / b[i - 1]
+        b[i] -= w * c[i - 1]
+        d[i] -= w * d[i - 1]
+    m = [0.0] * n
+    m[-1] = d[-1] / b[-1]
+    for i in range(n - 2, -1, -1):
+        m[i] = (d[i] - c[i] * m[i + 1]) / b[i]
+
+    def f(x):
+        lo, hi = 0, n - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if xs[mid] <= x:
+                lo = mid
+            else:
+                hi = mid
+        x = min(max(x, xs[lo]), xs[hi])
+        A = (xs[hi] - x) / h[lo]
+        B = 1.0 - A
+        return A * ys[lo] + B * ys[hi] + ((A ** 3 - A) * m[lo] + (B ** 3 - B) * m[hi]) * h[lo] ** 2 / 6.0
+    return f
+
+
+def resample(pts, n=N_RESAMPLE):
+    """Resample unit-chord Selig points onto common cosine-spaced x stations, so
+    that different airfoils can be blended point by point. Each surface is
+    splined as y(sqrt(x)), which stays smooth round a rounded leading edge."""
+    i_le = min(range(len(pts)), key=lambda i: pts[i][0])
+    xs = [0.5 * (1.0 - math.cos(math.pi * k / n)) for k in range(n + 1)]
+    surf = []
+    for part in (pts[:i_le + 1], pts[i_le:]):
+        us, ys = [], []
+        for x, y in sorted(part):
+            u = math.sqrt(max(x, 0.0))
+            if us and u - us[-1] < 1e-9:
+                continue
+            us.append(u)
+            ys.append(y)
+        f = _cubic_spline(us, ys)
+        surf.append([(x, f(math.sqrt(x))) for x in xs])
+    up, lo = surf
+    return list(reversed(up)) + lo[1:]
+
+
+class SectionedAirfoil:
+    """Airfoil that changes along the span.
+
+    sections: [(eta, name, pts)], eta = |y| / semi-span (0 centreline, 1 tip),
+    mirrored to both sides. Between two stations the resampled coordinates are
+    blended linearly; inboard of the first / outboard of the last station that
+    section is used as it is."""
+
+    def __init__(self, sections, n=N_RESAMPLE):
+        if not sections:
+            raise ValueError("Add at least one section")
+        secs = sorted(sections, key=lambda s: s[0])
+        for i, (eta, name, _) in enumerate(secs):
+            if not 0.0 <= eta <= 1.0:
+                raise ValueError(f"Section position {eta} of {name} must be between 0 and 1")
+            if i and eta - secs[i - 1][0] < 1e-6:
+                raise ValueError(f"Two sections at the same position ({eta:.3f})")
+        self.etas = [s[0] for s in secs]
+        self.names = [s[1] for s in secs]
+        self.afs = [resample(s[2], n) for s in secs]
+        self._cache = {}    # keeps blended lists alive (Planform caches stats by id)
+
+    @property
+    def name(self):
+        out = []
+        for nm in self.names:
+            if nm not in out:
+                out.append(nm)
+        return " / ".join(out)
+
+    def at(self, eta):
+        eta = min(abs(eta), 1.0)
+        key = round(eta, 9)
+        if key in self._cache:
+            return self._cache[key]
+        e = self.etas
+        if eta <= e[0]:
+            af = self.afs[0]
+        elif eta >= e[-1]:
+            af = self.afs[-1]
+        else:
+            i = max(k for k in range(len(e)) if e[k] <= eta)
+            t = (eta - e[i]) / (e[i + 1] - e[i])
+            af = [(xa, (1.0 - t) * ya + t * yb)
+                  for (xa, ya), (_, yb) in zip(self.afs[i], self.afs[i + 1])]
+        self._cache[key] = af
+        return af
+
+
 # ------------------------------------------------------------------ parameters
 
 TE_MIN_MM = 0.05
@@ -181,19 +292,31 @@ class Planform:
     def chord(self, y):
         return self.c_root * math.sqrt(max(1.0 - (y / self.b2) ** 2, 0.0))
 
-    def stations(self):
+    def stations(self, extra_eta=()):
+        """Span stations (mm). extra_eta: semi-span fractions that must get a
+        station of their own (e.g. where a user-defined section sits); they
+        replace any regular station closer than 1% of the semi-span."""
         n = int(self.p["n_half"])
         eta_tip = float(self.p["tip_eta"])
         out = []
         for k in range(-n, n + 1):
             th = (math.pi / 2.0) * k / n
             out.append(math.sin(th) * eta_tip * self.b2)
+        y_in = 0.0
         if self.bulb_on:
             yb = 1.15 * self.bulb_w
             nb = 8
-            out = [y for y in out if abs(y) > yb * 1.05]
+            y_in = yb * 1.05
+            out = [y for y in out if abs(y) > y_in]
             out += [yb * k / nb for k in range(-nb, nb + 1)]
-            out.sort()
+        gap = 0.01 * self.b2
+        for e in extra_eta:
+            ye = abs(e) * self.b2
+            if ye <= max(y_in, gap) or ye >= eta_tip * self.b2 - gap:
+                continue            # already covered by centreline / bulb / tip stations
+            out = [y for y in out if abs(abs(y) - ye) > gap]
+            out += [-ye, ye]
+        out.sort()
         return out
 
     # ---- blended bulb

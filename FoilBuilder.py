@@ -2,8 +2,10 @@
 lifting foil) from any airfoil .dat file.
 
 Buttons (Solid > Create panel):
-  * Foil from .dat   - dialog: pick .dat, preset, parameters -> builds the foil
-  * Rebuild Foil     - reads the foil_* user parameters and rebuilds
+  * Foil from .dat             - dialog: pick .dat, preset, parameters -> builds the foil
+  * Foil from .dat by section  - same, but several .dat/.csv files placed along the
+                                 semi-span; the section is blended between them
+  * Rebuild Foil               - reads the foil_* user parameters and rebuilds
 
 Geometry maths lives in foilgeom.py (pure Python). This file only talks to
 Fusion: construction planes, sketches, fitted splines, loft, flap split.
@@ -11,6 +13,7 @@ Fusion's internal length unit is cm; foilgeom works in mm (MM2CM below).
 """
 import adsk.core
 import adsk.fusion
+import json
 import os
 import sys
 import math
@@ -24,11 +27,13 @@ import foilgeom as G  # noqa: E402
 
 APP_NAME = "FoilBuilder"
 CMD_BUILD = "aquafoil_FoilBuilder_build"
+CMD_BUILD_SEC = "aquafoil_FoilBuilder_build_sections"
 CMD_REBUILD = "aquafoil_FoilBuilder_rebuild"
 PANEL_ID = "SolidCreatePanel"
 WORKSPACE_ID = "FusionSolidEnvironment"
 ATTR_GROUP = "aQuaFoil_FoilBuilder"
 MM2CM = 0.1
+DEFAULT_UP_AXIS = "Y"      # used when a design has no stored choice
 
 # user parameter name, key in foilgeom params, unit ('' = unitless), comment
 PARAMS = [
@@ -64,7 +69,9 @@ def _design():
     return d
 
 
-def _write_params(design, p, dat_path, up_axis):
+def _write_params(design, p, dat_path, up_axis, sections=None):
+    """sections: [(eta, path)] for a by-section build (dat_path is then left as
+    it was), None for a single-.dat build (clears any stored sections)."""
     ups = design.userParameters
     for name, key, unit, comment in PARAMS:
         val = p.get(key, G.DEFAULTS.get(key, 0))
@@ -76,8 +83,25 @@ def _write_params(design, p, dat_path, up_axis):
             existing.expression = expr
         else:
             ups.add(name, adsk.core.ValueInput.createByString(expr), unit, comment)
-    design.attributes.add(ATTR_GROUP, "dat_path", dat_path)
+    if sections:
+        design.attributes.add(ATTR_GROUP, "sections", json.dumps([[e, s] for e, s in sections]))
+    else:
+        design.attributes.add(ATTR_GROUP, "dat_path", dat_path)
+        old = design.attributes.itemByName(ATTR_GROUP, "sections")
+        if old:
+            old.deleteMe()
     design.attributes.add(ATTR_GROUP, "up_axis", up_axis)
+
+
+def _read_sections(design):
+    """[(eta, path)] stored by the last by-section build, or [] (single .dat)."""
+    a = design.attributes.itemByName(ATTR_GROUP, "sections")
+    if not a or not a.value:
+        return []
+    try:
+        return [(float(e), str(s)) for e, s in json.loads(a.value)]
+    except Exception:
+        return []
 
 
 def _read_params(design):
@@ -99,21 +123,7 @@ def _read_params(design):
         p["bulb_on"] = False          # designs saved before the bulb option existed
     a = design.attributes.itemByName(ATTR_GROUP, "dat_path")
     u = design.attributes.itemByName(ATTR_GROUP, "up_axis")
-    return p, (a.value if a else ""), (u.value if u else "Z")
-
-
-def _default_up_axis():
-    try:
-        pref = _app.preferences.generalPreferences.defaultModelingOrientation
-        if pref == adsk.core.DefaultModelingOrientations.YUpModelingOrientation:
-            return "Y"
-        if pref == adsk.core.DefaultModelingOrientations.ZUpModelingOrientation:
-            return "Z"
-        if pref == adsk.core.DefaultModelingOrientations.XUpModelingOrientation:
-            return "X"
-    except Exception:
-        pass
-    return "Y"
+    return p, (a.value if a else ""), (u.value if u else DEFAULT_UP_AXIS)
 
 
 def _mapper(up_axis):
@@ -190,11 +200,35 @@ def _delete_previous(design):
 
 
 # ============================================================ the builder
-def build_foil(p, dat_path, up_axis="Z", replace=True):
+def _load_dat(path):
+    with open(path, "r", errors="ignore") as f:
+        return G.parse_dat(f.read())
+
+
+def _load_sections(sections):
+    """[(eta, path)] -> G.SectionedAirfoil."""
+    secs = []
+    for eta, path in sections:
+        if not path or not os.path.isfile(path):
+            raise ValueError(f"Section file not found: {path}")
+        name, pts = _load_dat(path)
+        secs.append((float(eta), name, pts))
+    return G.SectionedAirfoil(secs)
+
+
+def build_foil(p, dat_path, up_axis=DEFAULT_UP_AXIS, replace=True, sections=None):
+    """sections: [(eta, path)] builds the foil by section (dat_path unused)."""
     design = _design()
-    with open(dat_path, "r", errors="ignore") as f:
-        af_name, af = G.parse_dat(f.read())
     pf = G.Planform(p)
+    if sections:
+        saf = _load_sections(sections)
+        af_name = saf.name
+        af_for = lambda y: saf.at(y / pf.b2)
+        extra_eta = saf.etas
+    else:
+        af_name, af = _load_dat(dat_path)
+        af_for = lambda y: af
+        extra_eta = ()
     P = _mapper(up_axis)
     root = design.rootComponent
     if replace:
@@ -219,7 +253,7 @@ def build_foil(p, dat_path, up_axis="Z", replace=True):
         occ, comp = None, root
 
     try:
-        result = _build_geometry(design, comp, af, pf, P)
+        result = _build_geometry(design, comp, af_for, pf, P, extra_eta)
     except Exception:
         if occ is not None:
             try:
@@ -239,16 +273,17 @@ def build_foil(p, dat_path, up_axis="Z", replace=True):
     except Exception:
         pass
 
-    _write_params(design, p, dat_path, up_axis)
+    _write_params(design, p, dat_path, up_axis, sections)
     return af_name, pf.summary()
 
 
-def _build_geometry(design, comp, af, pf, P):
+def _build_geometry(design, comp, af_for, pf, P, extra_eta=()):
+    """af_for(y) -> unit-chord Selig points of the airfoil at span station y."""
     helper = _tag(comp.sketches.add(comp.xYConstructionPlane))
     helper.name = "FoilBuilder helper points"
 
     profiles = []
-    for y in pf.stations():
+    for y in pf.stations(extra_eta):
         z0, dz = pf.z_span(y)
         phi = math.atan(dz)
         ny, nz = -math.sin(phi), math.cos(phi)
@@ -258,7 +293,7 @@ def _build_geometry(design, comp, af, pf, P):
         sk.name = f"section y={y:.1f}"
         sk.isComputeDeferred = True
         coll = adsk.core.ObjectCollection.create()
-        for (x, yy, zz) in pf.section(af, y):
+        for (x, yy, zz) in pf.section(af_for(y), y):
             coll.add(sk.modelToSketchSpace(P(x, yy, zz)))
         spl = sk.sketchCurves.sketchFittedSplines.add(coll)
         sk.sketchCurves.sketchLines.addByTwoPoints(spl.endSketchPoint, spl.startSketchPoint)
@@ -320,17 +355,27 @@ def _build_geometry(design, comp, af, pf, P):
 
 
 # ============================================================ dialog
-def _info_text(inputs):
+def _af_line(name, af):
+    t, xt, cm, xc = G.airfoil_stats(af)
+    return (f"<b>{name}</b>: {len(af)} pts, t/c {t*100:.1f}% @ {xt*100:.0f}%, "
+            f"camber {cm*100:.1f}% @ {xc*100:.0f}%")
+
+
+def _info_text(inputs, by_section=False):
     try:
         p = _params_from_inputs(inputs)
-        path = inputs.itemById("dat_path").text
         lines = []
-        if path and os.path.isfile(path):
-            with open(path, "r", errors="ignore") as f:
-                name, af = G.parse_dat(f.read())
-            t, xt, cm, xc = G.airfoil_stats(af)
-            lines.append(f"<b>{name}</b>: {len(af)} pts, t/c {t*100:.1f}% @ {xt*100:.0f}%, "
-                         f"camber {cm*100:.1f}% @ {xc*100:.0f}%")
+        if by_section:
+            secs = _sections_from_inputs(inputs)
+            for eta, path in sorted(secs):
+                if path and os.path.isfile(path):
+                    lines.append(f"η {eta:.3f} " + _af_line(*_load_dat(path)))
+            if secs:
+                _load_sections(secs)          # raises on duplicate / bad positions
+        else:
+            path = inputs.itemById("dat_path").text
+            if path and os.path.isfile(path):
+                lines.append(_af_line(*_load_dat(path)))
         s = G.Planform(p).summary()
         txt = f"Root chord {s['c_root']:.1f} mm, AR {s['AR']:.1f}"
         if "x_hinge" in s:
@@ -369,22 +414,79 @@ def _set_inputs(inputs, p):
     inputs.itemById("bulb_on").value = bool(p.get("bulb_on", False))
 
 
+# ---- section table (by-section dialog): one row per airfoil, [eta | file].
+#      Full paths are kept here, keyed by the row's file text box id.
+_sec_paths = {}
+_sec_seq = [0]
+
+
+def _button(inputs, cid, name, text):
+    btn = inputs.addBoolValueInput(cid, name, False, "", False)
+    try:
+        btn.text = text
+    except Exception:
+        pass
+    return btn
+
+
+def _add_section_row(inputs, eta, path):
+    tbl = inputs.itemById("sec_table")
+    ci = tbl.commandInputs
+    k = _sec_seq[0]
+    _sec_seq[0] += 1
+    sp = ci.addFloatSpinnerCommandInput(f"sec_eta_{k}", "η", "", 0, 1, 0.05, eta)
+    tx = ci.addTextBoxCommandInput(f"sec_file_{k}", "File", os.path.basename(path), 1, True)
+    tx.tooltip = path
+    _sec_paths[tx.id] = path
+    row = tbl.rowCount
+    tbl.addCommandInput(sp, row, 0)
+    tbl.addCommandInput(tx, row, 1)
+
+
+def _sections_from_inputs(inputs):
+    tbl = inputs.itemById("sec_table")
+    out = []
+    for r in range(tbl.rowCount):
+        sp, tx = tbl.getInputAtPosition(r, 0), tbl.getInputAtPosition(r, 1)
+        if sp and tx:
+            out.append((sp.value, _sec_paths.get(tx.id, "")))
+    return out
+
+
 class BuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
+    def __init__(self, by_section=False):
+        super().__init__()
+        self.by_section = by_section
+
     def notify(self, args):
         try:
             cmd = args.command
             inputs = cmd.commandInputs
             try:
-                p, dat, up = _read_params(_design())
+                design = _design()
+                p, dat, up = _read_params(design)
+                secs = _read_sections(design)
             except Exception:
-                p, dat, up = dict(G.DEFAULTS), "", _default_up_axis()
+                p, dat, up, secs = dict(G.DEFAULTS), "", DEFAULT_UP_AXIS, []
 
-            btn = inputs.addBoolValueInput("browse", "Airfoil .dat", False, "", False)
-            try:
-                btn.text = "Browse..."
-            except Exception:
-                pass
-            inputs.addTextBoxCommandInput("dat_path", "File", dat, 2, True)
+            if self.by_section:
+                _sec_paths.clear()
+                inputs.addTextBoxCommandInput(
+                    "sec_help", "", "One airfoil (.dat or .csv) per row. η = position along the "
+                    "semi-span (0 = centreline, 1 = tip), mirrored to both sides. The section is "
+                    "blended linearly between rows.", 3, True)
+                tbl = inputs.addTableCommandInput("sec_table", "Sections", 2, "1:3")
+                tbl.minimumVisibleRows = 3
+                tbl.maximumVisibleRows = 8
+                _button(inputs, "sec_add", "Add airfoils", "Add...")
+                _button(inputs, "sec_remove", "Remove row", "Remove selected (or last)")
+                if not secs and dat:
+                    secs = [(0.0, dat)]
+                for eta, path in secs:
+                    _add_section_row(inputs, eta, path)
+            else:
+                _button(inputs, "browse", "Airfoil .dat", "Browse...")
+                inputs.addTextBoxCommandInput("dat_path", "File", dat, 2, True)
             dd = inputs.addDropDownCommandInput("preset", "Preset",
                                                 adsk.core.DropDownStyles.TextListDropDownStyle)
             dd.listItems.add("(keep current values)", True, "")
@@ -421,20 +523,24 @@ class BuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
             g.addFloatSpinnerCommandInput("tip_eta", "Tip cut (fraction of semi-span)", "", 0.9, 0.9999, 0.001, p["tip_eta"])
             g.addFloatSpinnerCommandInput("te_thick_pct", "TE thickness (% chord)", "", 0.05, 3, 0.05, p["te_thick_pct"])
             ud = g.addDropDownCommandInput("up_axis", "Vertical axis", adsk.core.DropDownStyles.TextListDropDownStyle)
-            ud.listItems.add("Z", up != "Y", "")
-            ud.listItems.add("Y", up == "Y", "")
+            ud.listItems.add("Y", up != "Z", "")
+            ud.listItems.add("Z", up == "Z", "")
             g.addBoolValueInput("replace", "Replace previous foil", True, "", True)
 
-            inputs.addTextBoxCommandInput("info", "", _info_text(inputs), 3, True)
+            inputs.addTextBoxCommandInput("info", "", _info_text(inputs, self.by_section), 3, True)
 
-            h1 = BuildExecuteHandler(); cmd.execute.add(h1); _handlers.append(h1)
-            h2 = BuildChangedHandler(); cmd.inputChanged.add(h2); _handlers.append(h2)
-            h3 = BuildValidateHandler(); cmd.validateInputs.add(h3); _handlers.append(h3)
+            h1 = BuildExecuteHandler(self.by_section); cmd.execute.add(h1); _handlers.append(h1)
+            h2 = BuildChangedHandler(self.by_section); cmd.inputChanged.add(h2); _handlers.append(h2)
+            h3 = BuildValidateHandler(self.by_section); cmd.validateInputs.add(h3); _handlers.append(h3)
         except Exception:
             _ui.messageBox("FoilBuilder dialog failed:\n" + traceback.format_exc())
 
 
 class BuildChangedHandler(adsk.core.InputChangedEventHandler):
+    def __init__(self, by_section=False):
+        super().__init__()
+        self.by_section = by_section
+
     def notify(self, args):
         try:
             inputs = args.firingEvent.sender.commandInputs   # top level (args.inputs is per group)
@@ -445,21 +551,53 @@ class BuildChangedHandler(adsk.core.InputChangedEventHandler):
                 dlg.filter = "Airfoil (*.dat;*.txt);;All files (*.*)"
                 if dlg.showOpen() == adsk.core.DialogResults.DialogOK:
                     inputs.itemById("dat_path").text = dlg.filename
+            elif changed.id == "sec_add":
+                dlg = _ui.createFileDialog()
+                dlg.title = "Select airfoil coordinate file(s)"
+                dlg.filter = "Airfoil (*.dat;*.csv;*.txt);;All files (*.*)"
+                dlg.isMultiSelectEnabled = True
+                if dlg.showOpen() == adsk.core.DialogResults.DialogOK:
+                    files = list(dlg.filenames)
+                    n0 = inputs.itemById("sec_table").rowCount
+                    for i, path in enumerate(files):
+                        if n0 == 0:      # fresh table: spread root -> tip
+                            eta = i / (len(files) - 1) if len(files) > 1 else 0.0
+                        else:
+                            eta = 1.0
+                        _add_section_row(inputs, eta, path)
+            elif changed.id == "sec_remove":
+                tbl = inputs.itemById("sec_table")
+                r = tbl.selectedRow
+                if r < 0 or r >= tbl.rowCount:
+                    r = tbl.rowCount - 1
+                if r >= 0:
+                    _sec_paths.pop(tbl.getInputAtPosition(r, 1).id, None)
+                    tbl.deleteRow(r)
             elif changed.id == "preset":
                 name = changed.selectedItem.name if changed.selectedItem else ""
                 if name in G.PRESETS:
                     _set_inputs(inputs, G.PRESETS[name])
-            inputs.itemById("info").formattedText = _info_text(inputs)
+            inputs.itemById("info").formattedText = _info_text(inputs, self.by_section)
         except Exception:
             _ui.messageBox("FoilBuilder:\n" + traceback.format_exc())
 
 
 class BuildValidateHandler(adsk.core.ValidateInputsEventHandler):
+    def __init__(self, by_section=False):
+        super().__init__()
+        self.by_section = by_section
+
     def notify(self, args):
         try:
             inputs = args.firingEvent.sender.commandInputs
-            path = inputs.itemById("dat_path").text
-            ok = bool(path) and os.path.isfile(path)
+            if self.by_section:
+                secs = _sections_from_inputs(inputs)
+                etas = sorted(e for e, _ in secs)
+                ok = (bool(secs) and all(path and os.path.isfile(path) for _, path in secs)
+                      and all(b - a > 1e-6 for a, b in zip(etas, etas[1:])))
+            else:
+                path = inputs.itemById("dat_path").text
+                ok = bool(path) and os.path.isfile(path)
             if ok:
                 G.Planform(_params_from_inputs(inputs))
             args.areInputsValid = ok
@@ -468,14 +606,20 @@ class BuildValidateHandler(adsk.core.ValidateInputsEventHandler):
 
 
 class BuildExecuteHandler(adsk.core.CommandEventHandler):
+    def __init__(self, by_section=False):
+        super().__init__()
+        self.by_section = by_section
+
     def notify(self, args):
         try:
             inputs = args.command.commandInputs
             p = _params_from_inputs(inputs)
-            path = inputs.itemById("dat_path").text
             up = inputs.itemById("up_axis").selectedItem.name
             replace = inputs.itemById("replace").value
-            name, s = build_foil(p, path, up, replace)
+            if self.by_section:
+                name, s = build_foil(p, None, up, replace, _sections_from_inputs(inputs))
+            else:
+                name, s = build_foil(p, inputs.itemById("dat_path").text, up, replace)
             _ui.messageBox(f"Built {name}: root chord {s['c_root']:.1f} mm, AR {s['AR']:.1f}.\n"
                            "Edit the foil_* parameters (Modify > Change Parameters) and use "
                            "'Rebuild Foil' to regenerate.", APP_NAME)
@@ -496,6 +640,15 @@ class RebuildExecuteHandler(adsk.core.CommandEventHandler):
         try:
             design = _design()
             p, path, up = _read_params(design)
+            secs = _read_sections(design)
+            if secs:
+                missing = [s for _, s in secs if not os.path.isfile(s)]
+                if missing:
+                    _ui.messageBox("Section file(s) not found:\n" + "\n".join(missing) +
+                                   "\nRun 'Foil from .dat by section' again.", APP_NAME)
+                    return
+                name, s = build_foil(p, None, up, True, secs)
+                return
             if not path or not os.path.isfile(path):
                 _ui.messageBox("No valid .dat path stored in this design. Run 'Foil from .dat' first.", APP_NAME)
                 return
@@ -527,6 +680,10 @@ def run(context):
         _add_button(CMD_BUILD, "Foil from .dat",
                     "Build a parametric T-foil lifting surface from an airfoil .dat file",
                     BuildCreatedHandler())
+        _add_button(CMD_BUILD_SEC, "Foil from .dat by section",
+                    "Build the foil from several airfoil .dat/.csv files placed along the span, "
+                    "blending the section between them",
+                    BuildCreatedHandler(by_section=True))
         _add_button(CMD_REBUILD, "Rebuild Foil",
                     "Rebuild the foil from the foil_* user parameters", RebuildCreatedHandler())
     except Exception:
@@ -537,7 +694,7 @@ def run(context):
 def stop(context):
     try:
         panel = _ui.workspaces.itemById(WORKSPACE_ID).toolbarPanels.itemById(PANEL_ID)
-        for cid in (CMD_BUILD, CMD_REBUILD):
+        for cid in (CMD_BUILD, CMD_BUILD_SEC, CMD_REBUILD):
             c = panel.controls.itemById(cid)
             if c:
                 c.deleteMe()

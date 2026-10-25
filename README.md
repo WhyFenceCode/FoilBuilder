@@ -19,7 +19,7 @@ The add-in creates the construction planes, sketches, fitted splines, loft and s
 1. Copy the whole `FoilBuilder` folder somewhere permanent. Keep the folder name, `FoilBuilder.py` and `FoilBuilder.manifest` together.
 2. In Fusion: **Utilities → Add-Ins → Scripts and Add-Ins** (Shift+S) → **Add-Ins** tab → **+** (or the green plus), then select the `FoilBuilder` folder.
 3. Select it and click **Run** (tick *Run on Startup* if you like).
-4. Two buttons appear in **Solid → Create**: **Foil from .dat** and **Rebuild Foil**.
+4. Three buttons appear in **Solid → Create**: **Foil from .dat**, **Foil from .dat by section** and **Rebuild Foil**.
 
 ## Use
 1. **Foil from .dat** opens a dialog:
@@ -28,17 +28,23 @@ The add-in creates the construction planes, sketches, fitted splines, loft and s
    - **Planform:** span (mm), area (cm²), Δ (ellipse axis position from the TE, fraction of root chord). The root chord is computed as 4A/(πb).
    - **Flap:** on/off, flap chord / root chord, minimum flap chord where the flap ends.
    - **Curved anhedral:** tip drop (0 = flat) and the ellipse vertical semi-axis.
-   - **Advanced:** sections per half span, tip cut, TE thickness, vertical axis (Z or Y up), replace previous foil.
+   - **Advanced:** sections per half span, tip cut, TE thickness, vertical axis (Y up by default, or Z up), replace previous foil.
 2. Click **OK**. The bodies are `foil`, or `main element` + `flap`, and their features are grouped in the timeline as **"FoilBuilder: Foil …"**.
    - In **Assembly** (or classic) documents the foil goes in its own component **"Foil …"**.
    - In **Part Design** documents (only one component allowed) it's built directly in the part.
-3. All values are saved as **user parameters** (`foil_span`, `foil_area_cm2`, `foil_delta`, …). To change the design: **Modify → Change Parameters**, edit the values, then click **Rebuild Foil**. The previous foil component is replaced.
+3. **Foil from .dat by section** is the same dialog, but the section can change along the span:
+   - **Add...** picks one or more `.dat` / `.csv` files (Selig or Lednicer layout; a CSV is `x,y` per row, a header line is fine). Each file becomes a row with its position **η** = fraction of the semi-span (0 = centreline, 1 = tip), mirrored to both sides. Picking several files into an empty table spreads them evenly from root to tip; edit η in the table.
+   - **Remove** deletes the selected row (or the last one).
+   - Every airfoil is resampled onto the same cosine-spaced x stations, and each span station gets a linear blend of the two neighbouring rows. Inboard of the first row / outboard of the last, that row's airfoil is used unchanged. A section is placed exactly at each row's η.
+   - The file list and positions are stored in the design, so **Rebuild Foil** rebuilds by section too. Running plain **Foil from .dat** switches the design back to a single section.
+4. All values are saved as **user parameters** (`foil_span`, `foil_area_cm2`, `foil_delta`, …). To change the design: **Modify → Change Parameters**, edit the values, then click **Rebuild Foil**. The previous foil component is replaced.
 
 > [!note] Why "Rebuild" rather than live parameters
 > A spline loaded from a `.dat` can't be tied to Fusion parameter expressions, so changing a parameter can't update the loft by itself. Rebuild Foil regenerates the geometry from the parameters in one click. Anything you model *on top* of the foil (bulb, strut, fillets) should go in a separate component, because it won't survive a rebuild.
 
 ## Coordinate system
-- x aft (chordwise), y spanwise, z up (or Y up if selected, with span along -Z).
+- Default (Y up): model X aft (chordwise), Y up, span along -Z. With Z up selected: X aft, Y spanwise, Z up.
+- The choice is stored in the design, so Rebuild Foil keeps it; designs built before with Z up stay Z up until you pick Y in the dialog.
 - Origin: on the planform's ellipse axis at the centreline.
 - Foil incidence is 0°. Set it at assembly (strut incidence / rudder rake).
 
