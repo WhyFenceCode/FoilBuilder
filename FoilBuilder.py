@@ -6,6 +6,8 @@ Buttons (Solid > Create panel):
   * Foil from .dat by section  - same, but several .dat/.csv files placed along the
                                  semi-span; the section is blended between them
   * Rebuild Foil               - reads the foil_* user parameters and rebuilds
+Both build dialogs can add a vertical support (strut): a straight separate body
+that slots into a cutout in the foil/bulb.
 
 Geometry maths lives in foilgeom.py (pure Python). This file only talks to
 Fusion: construction planes, sketches, fitted splines, loft, flap split.
@@ -13,6 +15,7 @@ Fusion's internal length unit is cm; foilgeom works in mm (MM2CM below).
 """
 import adsk.core
 import adsk.fusion
+import importlib
 import json
 import os
 import sys
@@ -24,6 +27,9 @@ _HERE = os.path.dirname(os.path.realpath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import foilgeom as G  # noqa: E402
+# Fusion keeps one Python session for all add-ins, so a restarted add-in would
+# otherwise get the foilgeom it imported before any edits. Always load it fresh.
+G = importlib.reload(G)
 
 APP_NAME = "FoilBuilder"
 CMD_BUILD = "aquafoil_FoilBuilder_build"
@@ -53,8 +59,14 @@ PARAMS = [
     ("foil_bulb_nose_frac", "bulb_nose_frac", "", "Share of extra bulb length ahead of the wing LE"),
     ("foil_bulb_thickness", "bulb_thickness", "mm", "Bulb max thickness at the centreline"),
     ("foil_bulb_half_width", "bulb_half_width", "mm", "Spanwise half-width over which the bulb blends out"),
+    ("foil_strut_on", "strut_on", "", "1 = vertical support on top of the foil, 0 = none"),
+    ("foil_strut_chord", "strut_chord", "mm", "Vertical support chord"),
+    ("foil_strut_le_x", "strut_le_x", "mm", "Vertical LE aft of the foil nose on the centreline"),
+    ("foil_strut_height", "strut_height", "mm", "Height of the vertical's flat top above the foil chord line"),
+    ("foil_strut_rim_round", "strut_rim_round", "mm", "Round on the slot rim where the vertical enters the foil (0 = sharp)"),
+    ("foil_strut_slot_depth", "strut_slot_depth", "mm", "Slot depth below the lowest foil-top point under the vertical"),
 ]
-BOOL_KEYS = ("flap_on", "bulb_on")
+BOOL_KEYS = ("flap_on", "bulb_on", "strut_on")
 
 _app = None
 _ui = None
@@ -69,9 +81,10 @@ def _design():
     return d
 
 
-def _write_params(design, p, dat_path, up_axis, sections=None):
-    """sections: [(eta, path)] for a by-section build (dat_path is then left as
-    it was), None for a single-.dat build (clears any stored sections)."""
+def _write_params(design, p, foil_src, up_axis, strut_src=None):
+    """foil_src / strut_src: a .dat path, or [(eta, path)] for a by-section
+    build. A by-section build leaves the stored single .dat paths as they were;
+    a single-.dat build clears the stored sections."""
     ups = design.userParameters
     for name, key, unit, comment in PARAMS:
         val = p.get(key, G.DEFAULTS.get(key, 0))
@@ -83,23 +96,31 @@ def _write_params(design, p, dat_path, up_axis, sections=None):
             existing.expression = expr
         else:
             ups.add(name, adsk.core.ValueInput.createByString(expr), unit, comment)
-    if sections:
-        design.attributes.add(ATTR_GROUP, "sections", json.dumps([[e, s] for e, s in sections]))
-    else:
-        design.attributes.add(ATTR_GROUP, "dat_path", dat_path)
+    for src, single, multi in ((foil_src, "dat_path", "sections"),
+                               (strut_src, "strut_dat_path", "strut_sections")):
+        if isinstance(src, (list, tuple)):
+            design.attributes.add(ATTR_GROUP, multi, json.dumps([[e, s] for e, s in src]))
+        elif src:
+            design.attributes.add(ATTR_GROUP, single, src)
+    if not isinstance(foil_src, (list, tuple)):
         old = design.attributes.itemByName(ATTR_GROUP, "sections")
         if old:
             old.deleteMe()
     design.attributes.add(ATTR_GROUP, "up_axis", up_axis)
 
 
-def _read_sections(design):
+def _read_attr(design, key):
+    a = design.attributes.itemByName(ATTR_GROUP, key)
+    return a.value if a else ""
+
+
+def _read_sections(design, key="sections"):
     """[(eta, path)] stored by the last by-section build, or [] (single .dat)."""
-    a = design.attributes.itemByName(ATTR_GROUP, "sections")
-    if not a or not a.value:
+    v = _read_attr(design, key)
+    if not v:
         return []
     try:
-        return [(float(e), str(s)) for e, s in json.loads(a.value)]
+        return [(float(e), str(s)) for e, s in json.loads(v)]
     except Exception:
         return []
 
@@ -216,19 +237,38 @@ def _load_sections(sections):
     return G.SectionedAirfoil(secs)
 
 
-def build_foil(p, dat_path, up_axis=DEFAULT_UP_AXIS, replace=True, sections=None):
-    """sections: [(eta, path)] builds the foil by section (dat_path unused)."""
-    design = _design()
+def _airfoil_source(src):
+    """src: a .dat/.csv path, or [(eta, path)] for by-section ->
+    (name, af_at(eta), etas, afs). eta is the caller's span fraction."""
+    if isinstance(src, (list, tuple)):
+        saf = _load_sections(src)
+        return saf.name, saf.at, saf.etas, saf.afs
+    if not src or not os.path.isfile(src):
+        raise ValueError(f"Airfoil file not found: {src}")
+    name, af = _load_dat(src)
+    return name, (lambda eta: af), (), [af]
+
+
+def _prepare(p, foil_src, strut_src=None):
+    """Load the airfoils and run all geometry checks.
+    Returns (name, pf, af_for(y), extra_eta, strut) with strut = None or
+    (G.Strut, af_at(eta), etas)."""
     pf = G.Planform(p)
-    if sections:
-        saf = _load_sections(sections)
-        af_name = saf.name
-        af_for = lambda y: saf.at(y / pf.b2)
-        extra_eta = saf.etas
-    else:
-        af_name, af = _load_dat(dat_path)
-        af_for = lambda y: af
-        extra_eta = ()
+    name, af_at, extra_eta, _ = _airfoil_source(foil_src)
+    af_for = lambda y: af_at(abs(y) / pf.b2)
+    strut = None
+    if p.get("strut_on"):
+        if not strut_src:
+            raise ValueError("Pick an airfoil file for the vertical")
+        _, s_at, s_etas, s_afs = _airfoil_source(strut_src)
+        strut = (G.Strut(p, pf, af_for, s_afs), s_at, s_etas)
+    return name, pf, af_for, extra_eta, strut
+
+
+def build_foil(p, foil_src, up_axis=DEFAULT_UP_AXIS, replace=True, strut_src=None):
+    """foil_src / strut_src: a .dat/.csv path, or [(eta, path)] to build by section."""
+    design = _design()
+    af_name, pf, af_for, extra_eta, strut = _prepare(p, foil_src, strut_src)
     P = _mapper(up_axis)
     root = design.rootComponent
     if replace:
@@ -253,7 +293,7 @@ def build_foil(p, dat_path, up_axis=DEFAULT_UP_AXIS, replace=True, sections=None
         occ, comp = None, root
 
     try:
-        result = _build_geometry(design, comp, af_for, pf, P, extra_eta)
+        notes = _build_geometry(design, comp, af_for, pf, P, extra_eta, strut)
     except Exception:
         if occ is not None:
             try:
@@ -273,12 +313,118 @@ def build_foil(p, dat_path, up_axis=DEFAULT_UP_AXIS, replace=True, sections=None
     except Exception:
         pass
 
-    _write_params(design, p, dat_path, up_axis, sections)
-    return af_name, pf.summary()
+    _write_params(design, p, foil_src, up_axis, strut_src)
+    s = pf.summary()
+    if strut:
+        s.update(strut[0].summary())
+    s.update(notes)
+    return af_name, s
 
 
-def _build_geometry(design, comp, af_for, pf, P, extra_eta=()):
-    """af_for(y) -> unit-chord Selig points of the airfoil at span station y."""
+def _section_profile(comp, plane, pts, P, name, smooth_te=False):
+    """Sketch on plane: fitted spline through pts (foil axes, mm) closed by a
+    TE line, or with smooth_te by closing the spline itself (one smooth loop
+    with a tiny rounded TE). Returns its single profile."""
+    sk = _tag(comp.sketches.add(plane))
+    sk.name = name
+    sk.isComputeDeferred = True
+    coll = adsk.core.ObjectCollection.create()
+    for (x, y, z) in pts:
+        coll.add(sk.modelToSketchSpace(P(x, y, z)))
+    spl = sk.sketchCurves.sketchFittedSplines.add(coll)
+    if smooth_te:
+        spl.isClosed = True
+    else:
+        sk.sketchCurves.sketchLines.addByTwoPoints(spl.endSketchPoint, spl.startSketchPoint)
+    sk.isComputeDeferred = False
+    if sk.profiles.count != 1:
+        raise RuntimeError(f"{name} gave {sk.profiles.count} profiles")
+    sk.isVisible = False
+    adsk.doEvents()
+    return sk.profiles.item(0)
+
+
+def _loft(comp, profiles):
+    lofts = comp.features.loftFeatures
+    li = lofts.createInput(adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+    for pr in profiles:
+        li.loftSections.add(pr)
+    li.isSolid = True
+    return _tag(lofts.add(li)).bodies.item(0)
+
+
+def _combine(comp, target, tool, op, keep_tool, feature=False):
+    """Combine tool into target; returns the resulting target body (or the feature)."""
+    tools = adsk.core.ObjectCollection.create()
+    tools.add(tool)
+    ci = comp.features.combineFeatures.createInput(target, tools)
+    ci.operation = op
+    ci.isKeepToolBodies = keep_tool
+    feat = _tag(comp.features.combineFeatures.add(ci))
+    return feat if feature else feat.bodies.item(0)
+
+
+def _build_strut(comp, helper, foil, strut, P):
+    """Vertical support: a straight loft from the slot bottom to its flat top,
+    kept as its own body. The same shape is cut out of the foil as the slot,
+    and the slot rim on the foil is optionally rounded.
+    Returns (slotted foil, vertical, notes)."""
+    st, af_at, etas = strut
+    # One smooth closed loop per section (tiny rounded TE): a flat TE strip
+    # would leave two sharp corners in the slot rim, which can't be rounded.
+    profiles = []
+    for z in st.stations(etas):
+        plane = _plane_through(comp, helper, P(0.0, 0.0, z), P(10.0, 0.0, z), P(0.0, 10.0, z))
+        profiles.append(_section_profile(comp, plane, st.section(af_at(st.eta(z)), z), P,
+                                         f"vertical z={z:.1f}", smooth_te=True))
+    vert = _loft(comp, profiles)
+    vert.name = "vertical"
+    foil = _combine(comp, foil, vert, adsk.fusion.FeatureOperations.CutFeatureOperation, True)
+    foil.name = "foil"
+
+    notes = {}
+    if st.rim > 0:
+        try:
+            _round_slot_rim(comp, foil, st, P)
+        except Exception as e:
+            notes["rim_round_failed"] = f"{e}".splitlines()[0]
+    return foil, vert, notes
+
+
+def _round_slot_rim(comp, foil, st, P):
+    """Round the slot rim: edges between a slot wall (a face inside the
+    vertical's footprint) and the foil's outer surface."""
+    m = 1.0                                   # mm slack (face bounding boxes can be loose)
+    corners = [P(x, y, z) for x in (st.x_le - m, st.x_te + m) for y in (-st.half_t - m, st.half_t + m)
+               for z in (st.z_bot - m, st.h + m)]
+    lo = [min(getattr(c, a) for c in corners) for a in "xyz"]
+    hi = [max(getattr(c, a) for c in corners) for a in "xyz"]
+
+    def inside(face):
+        bb = face.boundingBox
+        return all(lo[i] <= getattr(bb.minPoint, a) and getattr(bb.maxPoint, a) <= hi[i]
+                   for i, a in enumerate("xyz"))
+
+    edges = adsk.core.ObjectCollection.create()
+    for i in range(foil.edges.count):
+        e = foil.edges.item(i)
+        if e.faces.count == 2 and inside(e.faces.item(0)) != inside(e.faces.item(1)):
+            edges.add(e)
+    if edges.count == 0:
+        raise RuntimeError("slot rim edges not found")
+    fillets = comp.features.filletFeatures
+    fi = fillets.createInput()
+    radius = adsk.core.ValueInput.createByReal(st.rim * MM2CM)
+    try:
+        fi.edgeSetInputs.addConstantRadiusEdgeSet(edges, radius, True)
+    except AttributeError:                       # older API
+        fi.addConstantRadiusEdgeSet(edges, radius, True)
+    _tag(fillets.add(fi))
+
+
+def _build_geometry(design, comp, af_for, pf, P, extra_eta=(), strut=None):
+    """af_for(y) -> unit-chord Selig points of the airfoil at span station y.
+    strut: None or (G.Strut, af_at(eta), etas) for the vertical support."""
     helper = _tag(comp.sketches.add(comp.xYConstructionPlane))
     helper.name = "FoilBuilder helper points"
 
@@ -289,30 +435,16 @@ def _build_geometry(design, comp, af_for, pf, P, extra_eta=()):
         ny, nz = -math.sin(phi), math.cos(phi)
         plane = _plane_through(comp, helper, P(0.0, y, z0), P(10.0, y, z0),
                                P(0.0, y + 10.0 * ny, z0 + 10.0 * nz))
-        sk = _tag(comp.sketches.add(plane))
-        sk.name = f"section y={y:.1f}"
-        sk.isComputeDeferred = True
-        coll = adsk.core.ObjectCollection.create()
-        for (x, yy, zz) in pf.section(af_for(y), y):
-            coll.add(sk.modelToSketchSpace(P(x, yy, zz)))
-        spl = sk.sketchCurves.sketchFittedSplines.add(coll)
-        sk.sketchCurves.sketchLines.addByTwoPoints(spl.endSketchPoint, spl.startSketchPoint)
-        sk.isComputeDeferred = False
-        if sk.profiles.count != 1:
-            raise RuntimeError(f"Section at y={y:.1f} mm gave {sk.profiles.count} profiles")
-        profiles.append(sk.profiles.item(0))
-        sk.isVisible = False
-        adsk.doEvents()
-    helper.isVisible = False
-
-    lofts = comp.features.loftFeatures
-    li = lofts.createInput(adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
-    for pr in profiles:
-        li.loftSections.add(pr)
-    li.isSolid = True
-    loft = _tag(lofts.add(li))
-    foil = loft.bodies.item(0)
+        profiles.append(_section_profile(comp, plane, pf.section(af_for(y), y), P,
+                                         f"section y={y:.1f}"))
+    foil = _loft(comp, profiles)
     foil.name = "foil"
+
+    # ---- vertical support (before the flap split, which only touches the foil)
+    notes = {}
+    if strut:
+        foil, _, notes = _build_strut(comp, helper, foil, strut, P)
+    helper.isVisible = False
 
     # ---- flap split (straight hinge line)
     poly = pf.flap_cutter_polygon()
@@ -351,31 +483,56 @@ def _build_geometry(design, comp, af_for, pf, P, extra_eta=()):
                 b.name = "flap starboard" if cy > 0 else "flap port"
             else:
                 b.name = "flap"
-    return True
+    return notes
 
 
 # ============================================================ dialog
+AIRFOIL_FILTER = "Airfoil (*.dat;*.csv;*.txt);;All files (*.*)"
+
+# vertical support spinners: key, label, min, max, step
+STRUT_SPINNERS = (
+    ("strut_chord", "Chord (mm)", 10, 400, 1),
+    ("strut_le_x", "LE aft of foil nose (mm)", -100, 400, 1),
+    ("strut_height", "Top height above chord line (mm)", 10, 2000, 5),
+    ("strut_rim_round", "Slot rim round (mm, 0 = sharp)", 0, 10, 0.25),
+    ("strut_slot_depth", "Slot depth into foil (mm)", 0.5, 50, 0.5),
+)
+# inputs shown only while the vertical support is ticked
+STRUT_IDS = ("strut_help", "strut_table", "strut_add", "strut_remove", "strut_browse",
+             "strut_dat_path") + tuple(s[0] for s in STRUT_SPINNERS)
+# section table buttons -> table
+ADD_BUTTONS = {"sec_add": "sec_table", "strut_add": "strut_table"}
+REMOVE_BUTTONS = {"sec_remove": "sec_table", "strut_remove": "strut_table"}
+
+
 def _af_line(name, af):
     t, xt, cm, xc = G.airfoil_stats(af)
     return (f"<b>{name}</b>: {len(af)} pts, t/c {t*100:.1f}% @ {xt*100:.0f}%, "
             f"camber {cm*100:.1f}% @ {xc*100:.0f}%")
 
 
-def _info_text(inputs, by_section=False):
+def _src_lines(src):
+    """Info lines for a .dat path or [(eta, path)]."""
+    if isinstance(src, (list, tuple)):
+        return [f"η {eta:.3f} " + _af_line(*_load_dat(path))
+                for eta, path in sorted(src) if path and os.path.isfile(path)]
+    return [_af_line(*_load_dat(src))] if src and os.path.isfile(src) else []
+
+
+def _sources_from_inputs(inputs, by_section):
+    """(foil_src, strut_src) as build_foil takes them."""
+    if by_section:
+        return _sections_from_inputs(inputs, "sec_table"), _sections_from_inputs(inputs, "strut_table")
+    return inputs.itemById("dat_path").text, inputs.itemById("strut_dat_path").text
+
+
+def _check(inputs, by_section):
+    """Run every check a build would. Returns (info lines, error message or None)."""
+    lines = []
     try:
         p = _params_from_inputs(inputs)
-        lines = []
-        if by_section:
-            secs = _sections_from_inputs(inputs)
-            for eta, path in sorted(secs):
-                if path and os.path.isfile(path):
-                    lines.append(f"η {eta:.3f} " + _af_line(*_load_dat(path)))
-            if secs:
-                _load_sections(secs)          # raises on duplicate / bad positions
-        else:
-            path = inputs.itemById("dat_path").text
-            if path and os.path.isfile(path):
-                lines.append(_af_line(*_load_dat(path)))
+        foil_src, strut_src = _sources_from_inputs(inputs, by_section)
+        lines += _src_lines(foil_src)
         s = G.Planform(p).summary()
         txt = f"Root chord {s['c_root']:.1f} mm, AR {s['AR']:.1f}"
         if "x_hinge" in s:
@@ -386,14 +543,30 @@ def _info_text(inputs, by_section=False):
             txt += (f"<br>Bulb {s['bulb_length']:.0f} mm long, nose {s['bulb_nose_ahead_of_le']:.0f} mm "
                     f"ahead of wing LE, {s['bulb_thickness']:.0f} mm thick")
         lines.append(txt)
-        return "<br>".join(lines)
+        if p["strut_on"]:
+            lines += ["Vertical " + l for l in _src_lines(strut_src)]
+        if not foil_src:
+            raise ValueError("Add at least one section" if by_section else "Pick an airfoil file")
+        strut = _prepare(p, foil_src, strut_src)[4]
+        if strut:
+            ss = strut[0].summary()
+            lines.append(f"Vertical {ss['strut_t']:.1f} mm thick, slot bottom at {ss['strut_z_bot']:.1f} mm, "
+                         f"{ss['strut_floor']:.1f} mm of foil left under the slot")
+        return lines, None
     except Exception as e:
-        return f"<i>{e}</i>"
+        return lines, str(e)
+
+
+def _info_text(inputs, by_section=False):
+    lines, err = _check(inputs, by_section)
+    if err:
+        lines.append(f"<i>{err}</i>")
+    return "<br>".join(lines)
 
 
 def _params_from_inputs(inputs):
     g = lambda i: inputs.itemById(i)
-    return dict(
+    p = dict(
         span=g("span").value, area_cm2=g("area_cm2").value, delta=g("delta").value,
         flap_on=g("flap_on").value, flap_frac=g("flap_frac").value,
         flap_min_chord=g("flap_min_chord").value, anhedral_depth=g("anhedral_depth").value,
@@ -401,7 +574,10 @@ def _params_from_inputs(inputs):
         tip_eta=g("tip_eta").value, te_thick_pct=g("te_thick_pct").value,
         bulb_on=g("bulb_on").value, bulb_length=g("bulb_length").value,
         bulb_nose_frac=g("bulb_nose_frac").value, bulb_thickness=g("bulb_thickness").value,
-        bulb_half_width=g("bulb_half_width").value)
+        bulb_half_width=g("bulb_half_width").value, strut_on=g("strut_on").value)
+    for key, *_ in STRUT_SPINNERS:
+        p[key] = g(key).value
+    return p
 
 
 def _set_inputs(inputs, p):
@@ -414,7 +590,15 @@ def _set_inputs(inputs, p):
     inputs.itemById("bulb_on").value = bool(p.get("bulb_on", False))
 
 
-# ---- section table (by-section dialog): one row per airfoil, [eta | file].
+def _show_strut(inputs):
+    on = inputs.itemById("strut_on").value
+    for cid in STRUT_IDS:
+        it = inputs.itemById(cid)
+        if it:
+            it.isVisible = on
+
+
+# ---- section tables (by-section dialog): one row per airfoil, [eta | file].
 #      Full paths are kept here, keyed by the row's file text box id.
 _sec_paths = {}
 _sec_seq = [0]
@@ -429,8 +613,17 @@ def _button(inputs, cid, name, text):
     return btn
 
 
-def _add_section_row(inputs, eta, path):
-    tbl = inputs.itemById("sec_table")
+def _add_table(inputs, prefix, table_id, label, help_text):
+    inputs.addTextBoxCommandInput(f"{prefix}_help", "", help_text, 2, True)
+    tbl = inputs.addTableCommandInput(table_id, label, 2, "1:3")
+    tbl.minimumVisibleRows = 3
+    tbl.maximumVisibleRows = 8
+    _button(inputs, f"{prefix}_add", "Add airfoils", "Add...")
+    _button(inputs, f"{prefix}_remove", "Remove row", "Remove selected (or last)")
+
+
+def _add_section_row(inputs, eta, path, table_id="sec_table"):
+    tbl = inputs.itemById(table_id)
     ci = tbl.commandInputs
     k = _sec_seq[0]
     _sec_seq[0] += 1
@@ -443,8 +636,8 @@ def _add_section_row(inputs, eta, path):
     tbl.addCommandInput(tx, row, 1)
 
 
-def _sections_from_inputs(inputs):
-    tbl = inputs.itemById("sec_table")
+def _sections_from_inputs(inputs, table_id="sec_table"):
+    tbl = inputs.itemById(table_id)
     out = []
     for r in range(tbl.rowCount):
         sp, tx = tbl.getInputAtPosition(r, 0), tbl.getInputAtPosition(r, 1)
@@ -466,23 +659,19 @@ class BuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 design = _design()
                 p, dat, up = _read_params(design)
                 secs = _read_sections(design)
+                strut_dat = _read_attr(design, "strut_dat_path")
+                strut_secs = _read_sections(design, "strut_sections")
             except Exception:
                 p, dat, up, secs = dict(G.DEFAULTS), "", DEFAULT_UP_AXIS, []
+                strut_dat, strut_secs = "", []
 
             if self.by_section:
                 _sec_paths.clear()
-                inputs.addTextBoxCommandInput(
-                    "sec_help", "", "One airfoil (.dat or .csv) per row. η = position along the "
-                    "semi-span (0 = centreline, 1 = tip), mirrored to both sides. The section is "
-                    "blended linearly between rows.", 3, True)
-                tbl = inputs.addTableCommandInput("sec_table", "Sections", 2, "1:3")
-                tbl.minimumVisibleRows = 3
-                tbl.maximumVisibleRows = 8
-                _button(inputs, "sec_add", "Add airfoils", "Add...")
-                _button(inputs, "sec_remove", "Remove row", "Remove selected (or last)")
-                if not secs and dat:
-                    secs = [(0.0, dat)]
-                for eta, path in secs:
+                _add_table(inputs, "sec", "sec_table", "Sections",
+                           "One airfoil (.dat or .csv) per row. η = position along the semi-span "
+                           "(0 = centreline, 1 = tip), mirrored to both sides. The section is "
+                           "blended linearly between rows.")
+                for eta, path in (secs or ([(0.0, dat)] if dat else [])):
                     _add_section_row(inputs, eta, path)
             else:
                 _button(inputs, "browse", "Airfoil .dat", "Browse...")
@@ -518,6 +707,22 @@ class BuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
             g.addFloatSpinnerCommandInput("bulb_half_width", "Blend half-width (mm)", "", 2, 200, 1,
                                           p.get("bulb_half_width", G.DEFAULTS["bulb_half_width"]))
 
+            g = inputs.addGroupCommandInput("g_strut", "Vertical support").children
+            g.addBoolValueInput("strut_on", "Vertical support", True, "", bool(p.get("strut_on", False)))
+            if self.by_section:
+                _add_table(g, "strut", "strut_table", "Vertical sections",
+                           "One airfoil per row. η = height from the foil top (0) to the "
+                           "vertical's flat top (1).")
+                for eta, path in (strut_secs or ([(0.0, strut_dat)] if strut_dat else [])):
+                    _add_section_row(inputs, eta, path, "strut_table")
+            else:
+                _button(g, "strut_browse", "Vertical .dat", "Browse...")
+                g.addTextBoxCommandInput("strut_dat_path", "File", strut_dat, 2, True)
+            for key, label, lo, hi, step in STRUT_SPINNERS:
+                g.addFloatSpinnerCommandInput(key, label, "", lo, hi, step,
+                                              float(p.get(key, G.DEFAULTS[key])))
+            _show_strut(inputs)
+
             g = inputs.addGroupCommandInput("g_adv", "Advanced").children
             g.addIntegerSpinnerCommandInput("n_half", "Sections per half", 4, 60, 1, int(p["n_half"]))
             g.addFloatSpinnerCommandInput("tip_eta", "Tip cut (fraction of semi-span)", "", 0.9, 0.9999, 0.001, p["tip_eta"])
@@ -527,7 +732,7 @@ class BuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
             ud.listItems.add("Z", up == "Z", "")
             g.addBoolValueInput("replace", "Replace previous foil", True, "", True)
 
-            inputs.addTextBoxCommandInput("info", "", _info_text(inputs, self.by_section), 3, True)
+            inputs.addTextBoxCommandInput("info", "", _info_text(inputs, self.by_section), 4, True)
 
             h1 = BuildExecuteHandler(self.by_section); cmd.execute.add(h1); _handlers.append(h1)
             h2 = BuildChangedHandler(self.by_section); cmd.inputChanged.add(h2); _handlers.append(h2)
@@ -545,34 +750,38 @@ class BuildChangedHandler(adsk.core.InputChangedEventHandler):
         try:
             inputs = args.firingEvent.sender.commandInputs   # top level (args.inputs is per group)
             changed = args.input
-            if changed.id == "browse":
+            if changed.id in ("browse", "strut_browse"):
                 dlg = _ui.createFileDialog()
                 dlg.title = "Select airfoil coordinate file"
-                dlg.filter = "Airfoil (*.dat;*.txt);;All files (*.*)"
+                dlg.filter = AIRFOIL_FILTER
                 if dlg.showOpen() == adsk.core.DialogResults.DialogOK:
-                    inputs.itemById("dat_path").text = dlg.filename
-            elif changed.id == "sec_add":
+                    target = "dat_path" if changed.id == "browse" else "strut_dat_path"
+                    inputs.itemById(target).text = dlg.filename
+            elif changed.id in ADD_BUTTONS:
+                table_id = ADD_BUTTONS[changed.id]
                 dlg = _ui.createFileDialog()
                 dlg.title = "Select airfoil coordinate file(s)"
-                dlg.filter = "Airfoil (*.dat;*.csv;*.txt);;All files (*.*)"
+                dlg.filter = AIRFOIL_FILTER
                 dlg.isMultiSelectEnabled = True
                 if dlg.showOpen() == adsk.core.DialogResults.DialogOK:
                     files = list(dlg.filenames)
-                    n0 = inputs.itemById("sec_table").rowCount
+                    n0 = inputs.itemById(table_id).rowCount
                     for i, path in enumerate(files):
-                        if n0 == 0:      # fresh table: spread root -> tip
+                        if n0 == 0:      # fresh table: spread 0 -> 1
                             eta = i / (len(files) - 1) if len(files) > 1 else 0.0
                         else:
                             eta = 1.0
-                        _add_section_row(inputs, eta, path)
-            elif changed.id == "sec_remove":
-                tbl = inputs.itemById("sec_table")
+                        _add_section_row(inputs, eta, path, table_id)
+            elif changed.id in REMOVE_BUTTONS:
+                tbl = inputs.itemById(REMOVE_BUTTONS[changed.id])
                 r = tbl.selectedRow
                 if r < 0 or r >= tbl.rowCount:
                     r = tbl.rowCount - 1
                 if r >= 0:
                     _sec_paths.pop(tbl.getInputAtPosition(r, 1).id, None)
                     tbl.deleteRow(r)
+            elif changed.id == "strut_on":
+                _show_strut(inputs)
             elif changed.id == "preset":
                 name = changed.selectedItem.name if changed.selectedItem else ""
                 if name in G.PRESETS:
@@ -589,20 +798,21 @@ class BuildValidateHandler(adsk.core.ValidateInputsEventHandler):
 
     def notify(self, args):
         try:
-            inputs = args.firingEvent.sender.commandInputs
-            if self.by_section:
-                secs = _sections_from_inputs(inputs)
-                etas = sorted(e for e, _ in secs)
-                ok = (bool(secs) and all(path and os.path.isfile(path) for _, path in secs)
-                      and all(b - a > 1e-6 for a, b in zip(etas, etas[1:])))
-            else:
-                path = inputs.itemById("dat_path").text
-                ok = bool(path) and os.path.isfile(path)
-            if ok:
-                G.Planform(_params_from_inputs(inputs))
-            args.areInputsValid = ok
+            args.areInputsValid = _check(args.firingEvent.sender.commandInputs, self.by_section)[1] is None
         except Exception:
             args.areInputsValid = False
+
+
+def _built_message(name, s):
+    msg = f"Built {name}: root chord {s['c_root']:.1f} mm, AR {s['AR']:.1f}."
+    if "strut_floor" in s:
+        msg += (f"\nVertical: {s['strut_t']:.1f} mm thick, slot bottom at {s['strut_z_bot']:.1f} mm, "
+                f"{s['strut_floor']:.1f} mm of foil under the slot.")
+    if "rim_round_failed" in s:
+        msg += ("\nThe slot rim round was skipped (Fusion could not make it); the rim is sharp. "
+                f"Try a smaller rim round.\nFusion said: {s['rim_round_failed']}")
+    return msg + ("\nEdit the foil_* parameters (Modify > Change Parameters) and use "
+                  "'Rebuild Foil' to regenerate.")
 
 
 class BuildExecuteHandler(adsk.core.CommandEventHandler):
@@ -616,13 +826,9 @@ class BuildExecuteHandler(adsk.core.CommandEventHandler):
             p = _params_from_inputs(inputs)
             up = inputs.itemById("up_axis").selectedItem.name
             replace = inputs.itemById("replace").value
-            if self.by_section:
-                name, s = build_foil(p, None, up, replace, _sections_from_inputs(inputs))
-            else:
-                name, s = build_foil(p, inputs.itemById("dat_path").text, up, replace)
-            _ui.messageBox(f"Built {name}: root chord {s['c_root']:.1f} mm, AR {s['AR']:.1f}.\n"
-                           "Edit the foil_* parameters (Modify > Change Parameters) and use "
-                           "'Rebuild Foil' to regenerate.", APP_NAME)
+            foil_src, strut_src = _sources_from_inputs(inputs, self.by_section)
+            name, s = build_foil(p, foil_src, up, replace, strut_src)
+            _ui.messageBox(_built_message(name, s), APP_NAME)
         except Exception:
             _ui.messageBox("FoilBuilder build failed:\n" + traceback.format_exc())
 
@@ -642,17 +848,18 @@ class RebuildExecuteHandler(adsk.core.CommandEventHandler):
             p, path, up = _read_params(design)
             secs = _read_sections(design)
             if secs:
-                missing = [s for _, s in secs if not os.path.isfile(s)]
-                if missing:
-                    _ui.messageBox("Section file(s) not found:\n" + "\n".join(missing) +
-                                   "\nRun 'Foil from .dat by section' again.", APP_NAME)
-                    return
-                name, s = build_foil(p, None, up, True, secs)
+                foil_src, strut_src = secs, _read_sections(design, "strut_sections")
+            else:
+                foil_src, strut_src = path, _read_attr(design, "strut_dat_path")
+            files = [s for _, s in foil_src] if secs else [foil_src]
+            if p["strut_on"]:
+                files += [s for _, s in strut_src] if secs else [strut_src]
+            missing = [f or "(none)" for f in files if not f or not os.path.isfile(f)]
+            if missing:
+                _ui.messageBox("Airfoil file(s) not found:\n" + "\n".join(missing) +
+                               "\nRun 'Foil from .dat' or 'Foil from .dat by section' again.", APP_NAME)
                 return
-            if not path or not os.path.isfile(path):
-                _ui.messageBox("No valid .dat path stored in this design. Run 'Foil from .dat' first.", APP_NAME)
-                return
-            name, s = build_foil(p, path, up, True)
+            build_foil(p, foil_src, up, True, strut_src)
         except Exception:
             _ui.messageBox("FoilBuilder rebuild failed:\n" + traceback.format_exc())
 

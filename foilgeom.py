@@ -246,7 +246,12 @@ PRESETS = {
                                        te_thick_pct=0.4, bulb_on=True, bulb_length=170.0,
                                        bulb_nose_frac=0.6, bulb_thickness=17.0, bulb_half_width=25.0),
 }
+STRUT_DEFAULTS = dict(strut_on=False, strut_chord=80.0, strut_le_x=15.0, strut_height=150.0,
+                      strut_rim_round=1.0, strut_slot_depth=5.0)
+STRUT_MIN_FLOOR_MM = 2.0      # foil material left under the slot
+STRUT_TE_MIN_MM = 0.5         # vertical's TE thickness (rounded off in CAD)
 DEFAULTS = dict(PRESETS["Bonetti main foil (E393)"])
+DEFAULTS.update(STRUT_DEFAULTS)
 
 
 class Planform:
@@ -408,3 +413,102 @@ class Planform:
             s["bulb_tail_x"] = self.bulb_tail_x()
             s["bulb_thickness"] = self.bulb_t
         return s
+
+
+# ------------------------------------------------------------------ vertical support
+
+
+def _surfaces(pts):
+    """3D section points (x, y, z), Selig order -> upper and lower surface as
+    x-sorted (xs, zs) lists."""
+    i_le = min(range(len(pts)), key=lambda i: pts[i][0])
+    out = []
+    for part in (pts[:i_le + 1], pts[i_le:]):
+        s = sorted((q[0], q[2]) for q in part)
+        out.append(([q[0] for q in s], [q[1] for q in s]))
+    return out
+
+
+class Strut:
+    """Vertical support leaving the top of the foil at the centreline.
+
+    A straight, separate piece. Foil axes: chord along x, thickness along y,
+    straight up along z to strut_height (measured from the foil chord line at
+    the centreline), where it ends in a flat top face. At the bottom it reaches
+    strut_slot_depth below the lowest point of the foil top under it; the same
+    shape is cut out of the foil as the slot, whose rim can be rounded by
+    strut_rim_round (done in CAD).
+    eta = 0 at the highest point of the foil top under the vertical, 1 at its top."""
+
+    def __init__(self, p, pf, foil_af_for, strut_afs, n=200):
+        self.c = float(p["strut_chord"])
+        self.h = float(p["strut_height"])
+        self.rim = float(p.get("strut_rim_round", 0.0))
+        self.slot = float(p["strut_slot_depth"])
+        if self.c <= 0 or self.slot <= 0 or self.rim < 0:
+            raise ValueError("Vertical chord and slot depth must be positive, the rim round 0 or more")
+        # strut_le_x: LE position aft of the foil nose (bulb nose with a bulb) on the centreline
+        self.x_le = _surfaces(pf.section(foil_af_for(0.0), 0.0))[0][0][0] + float(p["strut_le_x"])
+        self.x_te = self.x_le + self.c
+        # the CAD side closes this section with a smooth rounded TE, which needs a
+        # little room to turn: never thinner than STRUT_TE_MIN_MM
+        self.te = max(float(p["te_thick_pct"]) / 100.0, STRUT_TE_MIN_MM / self.c)
+        self.half_t = max(airfoil_stats(a)[0] for a in strut_afs) * self.c / 2.0
+        margin = self.rim + 1.0               # foil material kept round the slot
+
+        # foil surfaces under the vertical, on the centreline and at its sides
+        top_min, low_max = float("inf"), -float("inf")
+        for y in (0.0, self.half_t):
+            (ux, uz), (lx, lz) = _surfaces(pf.section(foil_af_for(y), y))
+            if y == 0.0 and (self.x_le - margin <= ux[0] or self.x_te + margin >= ux[-1]):
+                raise ValueError("The vertical must sit within the foil chord at the centreline, "
+                                 f"with {margin:g} mm to spare (check chord / LE position)")
+            xs = [self.x_le + self.c * k / n for k in range(n + 1)]
+            if y == 0.0:
+                self.z_root = max(_interp(x, ux, uz) for x in xs)
+            top_min = min(top_min, min(_interp(x, ux, uz) for x in xs))
+            low_max = max(low_max, max(_interp(x, lx, lz) for x in xs))
+        self.z_bot = top_min - self.slot
+        self.floor = self.z_bot - low_max
+        if self.floor < STRUT_MIN_FLOOR_MM:
+            raise ValueError(f"Slot too deep: only {self.floor:.1f} mm of foil left under it "
+                             f"(min {STRUT_MIN_FLOOR_MM:.0f} mm)")
+        h_min = self.z_root + 5.0
+        if self.h < h_min:
+            raise ValueError(f"Vertical height must be at least {h_min:.0f} mm (foil top + 5 mm)")
+        if pf.flap_cutter_polygon():
+            if pf.bulb_on:
+                bad = (self.half_t + margin >= pf.bulb_w
+                       or self.x_te + margin >= pf.bulb_tail_x() + 5.0)
+            else:
+                bad = self.x_te + margin >= pf.flap()[0]
+            if bad:
+                raise ValueError("The vertical's slot overlaps the flap: move it forward, "
+                                 "shorten its chord or turn the flap off")
+
+    def eta(self, z):
+        return min(max((z - self.z_root) / (self.h - self.z_root), 0.0), 1.0)
+
+    def stations(self, etas=()):
+        """Section heights (mm): tenon bottom and top; with sections also the
+        foil top, each section's eta and 3 levels in between."""
+        zs = {self.z_bot, self.h}
+        if etas:
+            pts = sorted(set([0.0, 1.0] + [min(max(e, 0.0), 1.0) for e in etas]))
+            for a, b in zip(pts, pts[1:]):
+                for k in range(4):
+                    zs.add(self.z_root + (a + (b - a) * k / 4.0) * (self.h - self.z_root))
+        return sorted(zs)
+
+    def section(self, af, z):
+        """3D points (mm) of the horizontal section at height z, Selig order."""
+        i_le = min(range(len(af)), key=lambda i: af[i][0])
+        pts = []
+        for i, (xa, ya) in enumerate(af):
+            sgn = 0.0 if i == i_le else (1.0 if i < i_le else -1.0)
+            pts.append((self.x_le + xa * self.c, (ya + sgn * xa * self.te / 2.0) * self.c, z))
+        return pts
+
+    def summary(self):
+        return {"strut_t": 2 * self.half_t, "strut_floor": self.floor,
+                "strut_z_root": self.z_root, "strut_z_bot": self.z_bot}

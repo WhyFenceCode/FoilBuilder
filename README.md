@@ -10,6 +10,7 @@ Builds a hydrofoil lifting surface natively in Fusion from any airfoil `.dat` fi
 - **Main foil**: bi-elliptical planform, with a flap split on a straight hinge line.
 - **Rudder foil**: same planform, with curved ("banana") anhedral.
 - Optional blended bulb at the centreline.
+- Optional vertical support (strut): a straight, separate piece that slots into a cutout in the top of the foil/bulb.
 
 The add-in creates the construction planes, sketches, fitted splines, loft and split in Fusion, so the geometry is Fusion's own B-rep (no Python CAD libraries).
 
@@ -30,14 +31,22 @@ The add-in creates the construction planes, sketches, fitted splines, loft and s
    - **Flap:** on/off, flap chord / root chord, minimum flap chord where the flap ends.
    - **Curved anhedral:** tip drop (0 = flat) and the ellipse vertical semi-axis.
    - **Bulb (blended):** on/off, length at the centreline, share of the extra length ahead of the LE, max thickness, and the spanwise half-width over which it blends into the wing. With a flap, the flap is split into port and starboard halves around the bulb.
+   - **Vertical support:** off by default. Tick it to add a vertical (strut) on the centreline, then pick its airfoil `.dat` / `.csv` (chord along x, thickness spanwise) and set:
+     - **Chord** and **LE aft of foil nose**: chordwise position, measured from the foil's nose on the centreline (the bulb nose when there is a bulb).
+     - **Top height above chord line**: the vertical is straight, with the same section all the way from the slot bottom to a flat top face at this height, measured from the foil chord line at the centreline. Extrude from that face to lengthen it.
+     - **Slot depth into foil**: the vertical reaches this far below the lowest point of the foil top under it, ending in a flat bottom. The same shape is cut out of the foil as the slot, so the vertical drops in and can be screwed from below. Screw holes aren't modelled.
+     - **Slot rim round**: a small round on the edge of the cutout where the vertical enters the foil (default 1 mm, 0 = sharp). If Fusion can't make it, the foil is still built with a sharp rim, and the message says so.
+     - The vertical's section is closed with a tiny rounded TE (at least 0.5 mm thick), so the slot rim has no sharp corners.
+     - The info line shows the vertical's thickness and how much foil is left under the slot (at least 2 mm). If it doesn't fit (slot too deep, vertical outside the foil chord, slot overlapping the flap, or top below the foil), the reason is shown and **OK** stays disabled.
    - **Advanced:** sections per half span, tip cut, TE thickness, vertical axis (Y up by default, or Z up), replace previous foil.
-2. Click **OK**. The bodies are `foil`, or `main element` + `flap`, and their features are grouped in the timeline as **"FoilBuilder: Foil …"**.
+2. Click **OK**. The bodies are `foil`, or `main element` + `flap`, plus a separate `vertical` body when the support is on, and their features are grouped in the timeline as **"FoilBuilder: Foil …"**.
    - In **Assembly** (or classic) documents the foil goes in its own component **"Foil …"**.
    - In **Part Design** documents (only one component allowed) it's built directly in the part.
 3. **Foil from .dat by section** is the same dialog, but the section can change along the span:
    - **Add...** picks one or more `.dat` / `.csv` files (Selig or Lednicer layout; a CSV is `x,y` per row, a header line is fine). Each file becomes a row with its position **η** = fraction of the semi-span (0 = centreline, 1 = tip), mirrored to both sides. Picking several files into an empty table spreads them evenly from root to tip; edit η in the table.
    - **Remove** deletes the selected row (or the last one).
    - Every airfoil is resampled onto the same cosine-spaced x stations, and each span station gets a linear blend of the two neighbouring rows. Inboard of the first row / outboard of the last, that row's airfoil is used unchanged. A section is placed exactly at each row's η.
+   - The **Vertical support** group gets its own section table. Here η is the height fraction, from the highest point of the foil top under the vertical (0) to its flat top (1). The tenon uses the η = 0 section.
    - The file list and positions are stored in the design, so **Rebuild Foil** rebuilds by section too. Running plain **Foil from .dat** switches the design back to a single section.
 4. All values are saved as **user parameters** (`foil_span`, `foil_area_cm2`, `foil_delta`, …). To change the design: **Modify → Change Parameters**, edit the values, then click **Rebuild Foil**. The previous foil component is replaced.
 
