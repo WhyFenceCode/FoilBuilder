@@ -247,7 +247,7 @@ PRESETS = {
                                        bulb_nose_frac=0.6, bulb_thickness=17.0, bulb_half_width=25.0),
 }
 STRUT_DEFAULTS = dict(strut_on=False, strut_chord=80.0, strut_le_x=25.0, strut_height=150.0,
-                      strut_rim_round=1.0, strut_slot_depth=5.0)
+                      strut_rim_round=0.5, strut_slot_depth=5.0)
 STRUT_MIN_FLOOR_MM = 2.0      # foil material left under the slot
 STRUT_TE_MIN_MM = 0.5         # vertical's TE thickness (rounded off in CAD)
 BLEND_DEFAULTS = dict(blend_on=False, blend_height=3.0, blend_width=6.0, blend_front_width=6.0,
@@ -638,6 +638,7 @@ class Blend:
             raise ValueError(f"Vertical height must be at least {st.z_root + self.h + 5.0:.0f} mm "
                              "(blend + 5 mm)")
         self.tan_foot = math.tan(math.radians(BLEND_FOOT_DEG))
+        self.wall_deg = wall
         self.cot_wall = 1.0 / math.tan(math.radians(max(wall, 1.0)))
 
         # the vertical's outline as a closed loop, with cumulative arc length
@@ -869,6 +870,13 @@ class Blend:
         upper = [pt(s, z) for s, z in self._even(up, n_up)]
         lower = [pt(s, z) for s, z in self._even(list(reversed(lo)), n_lo)]
         return x, y, nx, ny, upper, lower
+
+    def rim_round_limit(self):
+        """Roughly the largest round that fits on the collar's top edge. That
+        edge is a wedge as sharp as the blend angle, and a round of radius r
+        on it reaches r / tan(angle / 2) down each face, which has to stay
+        within the collar's height."""
+        return 0.8 * self.h * math.tan(math.radians(max(self.wall_deg, 1.0)) / 2.0)
 
     def summary(self):
         return {"blend_rise": self.h, "blend_width": self.w,

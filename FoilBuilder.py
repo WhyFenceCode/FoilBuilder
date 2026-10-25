@@ -400,10 +400,11 @@ def _combine(comp, target, tool, op, keep_tool, feature=False):
 
 def _build_strut(comp, helper, foil, strut, P):
     """Vertical support: a straight loft from the slot bottom to its flat top,
-    kept as its own body. With a blend, a collar lofted from horizontal offset
-    sections is first joined to the foil. Then the vertical's shape is cut out
-    of the foil as the slot, and without a blend the slot rim is optionally
-    rounded. Returns (slotted foil, vertical, notes)."""
+    kept as its own body. With a blend, a collar lofted from fillet-style
+    slices round the vertical is first joined to the foil. Then the vertical's
+    shape is cut out of the foil as the slot, and the slot rim (with a blend:
+    the top of the collar) is optionally rounded, as a lead-in for assembly.
+    Returns (slotted foil, vertical, notes)."""
     st, af_at, etas, blend = strut
     # One smooth closed loop per section (tiny rounded TE): a flat TE strip
     # would leave two sharp corners in the slot rim, which can't be rounded.
@@ -432,7 +433,7 @@ def _build_strut(comp, helper, foil, strut, P):
     foil = _combine(comp, foil, vert, ops.CutFeatureOperation, True)
     foil.name = "foil"
 
-    if st.rim > 0 and not blend:
+    if st.rim > 0:
         try:
             _round_slot_rim(comp, foil, st, P)
         except Exception as e:
@@ -573,7 +574,7 @@ STRUT_SPINNERS = (
     ("strut_le_x", "LE aft of foil nose (mm)", -100, 400, 1),
     ("strut_height", "Top height above chord line (mm)", 10, 2000, 5),
     ("strut_slot_depth", "Slot depth into foil (mm)", 0.5, 50, 0.5),
-    ("strut_rim_round", "Slot rim round (mm, 0 = sharp; no blend)", 0, 10, 0.25),
+    ("strut_rim_round", "Slot rim round (mm, 0 = sharp)", 0, 10, 0.25),
 )
 # blend (collar) spinners, same layout
 BLEND_SPINNERS = (
@@ -639,6 +640,11 @@ def _check(inputs, by_section):
             lines.append(_strut_line(ss))
             if strut[3]:
                 lines.append(_blend_line(strut[3].summary()))
+                limit = strut[3].rim_round_limit()
+                if strut[0].rim > limit:
+                    lines.append(f"<i>A slot rim round over about {limit:.2f} mm may not fit on this blend's "
+                                 "sharp top edge (it would then be skipped): use a smaller round, or a larger "
+                                 "blend angle.</i>")
         return lines, None
     except Exception as e:
         return lines, str(e)
@@ -700,7 +706,6 @@ def _show_strut(inputs):
     blend = on and inputs.itemById("blend_on").value
     shown = {cid: on for cid in STRUT_IDS}
     shown.update({key: blend for key, *_ in BLEND_SPINNERS})
-    shown["strut_rim_round"] = on and not blend
     for cid, vis in shown.items():
         it = inputs.itemById(cid)
         if it:

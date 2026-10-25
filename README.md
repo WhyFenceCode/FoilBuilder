@@ -57,7 +57,7 @@ Off by default. Tick **Vertical support** to add a vertical (strut) on the centr
 - **LE aft of foil nose** (default 25 mm): measured on the centreline from the foil's nose, which is the bulb nose when there's a bulb. Negative values put the LE ahead of the nose. The vertical can sit anywhere along the foil, even overhanging its nose or tail. Where it overhangs, its bottom is trimmed level with that end of the foil, so nothing hangs below.
 - **Top height above chord line** (default 150 mm): height of the vertical's flat top face, measured from the foil's chord line at the centreline. Extrude that face to lengthen the vertical.
 - **Slot depth into foil** (default 5 mm): the vertical's bottom, and the cutout, follow the foil's top surface this far down, always leaving at least 2 mm of foil underneath. Where the foil is too thin for that, the vertical simply sits on the surface. If the vertical overhangs a blunt bulb nose or tail, the last few mm can leave less than 2 mm, because the trim drops to that end's height so there's no gap at the vertical's sides. The info line reports the actual minimum.
-- **Slot rim round** (default 1 mm, 0 = sharp; only without the blend): rounds the edge of the cutout. If Fusion can't make the round, the foil is still built with a sharp rim and the message says so.
+- **Slot rim round** (default 0.5 mm, 0 = sharp): rounds the edge of the cutout, which gives the vertical a softer lead-in when you assemble it. With the blend on, this rounds the top of the collar instead (see below). If Fusion can't make the round, the foil is still built with a sharp rim and the message says so.
 
 The info line shows the vertical's thickness, the deepest point of the slot, the least foil left under it, and any overhang. The vertical can't be built if it isn't over the foil at all, if its slot would overlap the flap, or if its top is too low.
 
@@ -70,6 +70,8 @@ Off by default. Tick **Blend foil up into the vertical** and the foil rises in a
 - **Blend angle at vertical** (default 25°): the collar's angle where it meets the vertical, measured from vertical. Smaller is closer to tangent. 0 would leave a knife edge at the rim.
 
 The blend never blocks a build. It fades out smoothly where the foil gets thin (towards a nose or tail, or where the vertical overhangs) and before the flap.
+
+With the blend on, **Slot rim round** rounds the collar's top edge, where it meets the vertical. That edge is a wedge as sharp as the blend angle, so only a small round fits. With the defaults (3 mm high, 25°) that's about 0.5 mm, and a larger blend angle allows more: about 1 mm at 45°. If the round is bigger than that, the info line warns you. If Fusion then can't make it, the build still finishes with a sharp edge.
 
 How it's built: FoilBuilder works out the collar shape itself and lofts it like a fillet. It doesn't use Fusion's fillet tool, which can't handle this joint. The slices are cut at right angles to the vertical's wall all the way round it, fanning out round its nose and tail. Each has the same make-up and the same number of evenly spaced points, which keeps the surface smooth. Each slice reaches 1.2 mm under the foil's surface, and the collar meets the foil 8° off tangent. Both make the join a clean overlap rather than two surfaces just touching, which is what Fusion handles reliably. That hidden part is never visible, and where the collar fades out its surface sits 0.3 mm under the foil's.
 
