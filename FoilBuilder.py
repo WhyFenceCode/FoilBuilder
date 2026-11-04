@@ -9,7 +9,8 @@ Buttons (Solid > Create panel):
 Both build dialogs can add a vertical support (strut): a straight separate body
 that slots into a cutout in the foil/bulb.
 
-Geometry maths lives in foilgeom.py (pure Python). This file only talks to
+Geometry maths lives in foilgeom.py (numpy; Fusion's Python doesn't ship it,
+so numpy is installed into this add-in's lib/ folder). This file only talks to
 Fusion: construction planes, sketches, fitted splines, loft, flap split.
 Fusion's internal length unit is cm; foilgeom works in mm (MM2CM below).
 """
@@ -24,12 +25,17 @@ import time
 import traceback
 
 _HERE = os.path.dirname(os.path.realpath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-import foilgeom as G  # noqa: E402
-# Fusion keeps one Python session for all add-ins, so a restarted add-in would
-# otherwise get the foilgeom it imported before any edits. Always load it fresh.
-G = importlib.reload(G)
+for _p in (os.path.join(_HERE, "lib"), _HERE):          # lib/: numpy, installed with the add-in
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+try:
+    import foilgeom as G  # noqa: E402
+    # Fusion keeps one Python session for all add-ins, so a restarted add-in would
+    # otherwise get the foilgeom it imported before any edits. Always load it fresh.
+    G = importlib.reload(G)
+    _IMPORT_ERROR = None
+except ImportError as _e:      # numpy missing from lib/: run() explains
+    G, _IMPORT_ERROR = None, _e
 
 APP_NAME = "FoilBuilder"
 CMD_BUILD = "aquafoil_FoilBuilder_build"
@@ -1008,6 +1014,11 @@ def run(context):
     try:
         _app = adsk.core.Application.get()
         _ui = _app.userInterface
+        if _IMPORT_ERROR is not None:
+            _ui.messageBox("FoilBuilder needs numpy, installed in its own 'lib' folder:\n"
+                           f"{os.path.join(_HERE, 'lib')}\n\nSee README.md (Install). "
+                           f"Python said: {_IMPORT_ERROR}", APP_NAME)
+            return
         _add_button(CMD_BUILD, "Foil from .dat",
                     "Build a parametric T-foil lifting surface from an airfoil .dat file",
                     BuildCreatedHandler())

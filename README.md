@@ -21,11 +21,23 @@ What it can build:
 ## Install
 
 1. Copy the whole `FoilBuilder` folder somewhere permanent. Keep `FoilBuilder.py`, `foilgeom.py` and `FoilBuilder.manifest` together in a folder named `FoilBuilder`.
-2. In Fusion, open **Utilities → Add-Ins → Scripts and Add-Ins** (Shift+S), go to the **Add-Ins** tab, click **+** and select the `FoilBuilder` folder.
-3. Select it and click **Run**. Tick *Run on Startup* if you want it every time.
-4. Three buttons appear under **Solid → Create**: **Foil from .dat**, **Foil from .dat by section** and **Rebuild Foil**.
+2. Install numpy into the add-in's own `lib` folder (see [numpy](#numpy) below). Fusion's built-in Python doesn't include it.
+3. In Fusion, open **Utilities → Add-Ins → Scripts and Add-Ins** (Shift+S), go to the **Add-Ins** tab, click **+** and select the `FoilBuilder` folder.
+4. Select it and click **Run**. Tick *Run on Startup* if you want it every time.
+5. Three buttons appear under **Solid → Create**: **Foil from .dat**, **Foil from .dat by section** and **Rebuild Foil**.
 
 After updating the files, **Stop** and **Run** the add-in again so Fusion picks up the changes.
+
+### numpy
+The geometry code uses numpy. Fusion's Python ships without numpy and without pip, so numpy goes into a `lib` folder inside `FoilBuilder`, which the add-in adds to its path. That numpy has to be built for the same Python version as Fusion's. At the time of writing that's Python 3.14, 64-bit; check `python3XX.dll` in Fusion's install folder under `%LOCALAPPDATA%\Autodesk\webdeploy\production\`.
+
+With a standalone Python of that version installed, run this from the `FoilBuilder` folder:
+
+```bash
+py -3.14 -m pip install --target lib numpy
+```
+
+`lib/` is about 55 MB and is kept out of git (`.gitignore`). If numpy is missing or doesn't match Fusion's Python, the add-in shows a message saying so when it starts, instead of adding its buttons. When an update moves Fusion to a newer Python, delete `lib` and run the command again with the new version.
 
 ## Building a foil
 
@@ -132,9 +144,10 @@ To edit:
 | File | Purpose |
 |---|---|
 | `FoilBuilder.py` | Fusion add-in: dialogs and Fusion geometry calls |
-| `foilgeom.py` | Pure-Python geometry core (planform, sections, vertical, blend). Also usable outside Fusion, e.g. in optimisation scripts or checks |
+| `foilgeom.py` | Geometry core in Python and numpy (planform, sections, vertical, blend). Also usable outside Fusion, e.g. in optimisation scripts or checks |
 | `FoilBuilder.manifest` | Add-in manifest |
 | `airfoils/` | Example sections |
+| `lib/` | numpy for Fusion's Python (installed locally, not in git; see [numpy](#numpy)) |
 
 ## Extending
 New planform options (chord at N stations, twist, sweep) go in `foilgeom.Planform`, and the Fusion side doesn't need to change. Because the same `foilgeom.py` can run inside an optimisation loop, the optimiser and the CAD always describe the same geometry.
