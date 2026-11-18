@@ -430,6 +430,9 @@ class Strut:
     end, so the overhang is trimmed level with it instead of hanging below.
     The CAD side trims the vertical to this line and cuts it out of the foil
     as the slot, whose rim can be rounded by strut_rim_round.
+    strut_slot_depth 0: no slot. The vertical sits on the foil, its bottom
+    following the foil's top surface exactly (CAD trims it with the foil
+    body itself); the tenon line then only trims an overhang.
     eta = 0 at the highest point of the foil top under the vertical, 1 at its top."""
 
     def __init__(self, p, pf, foil_af_for, strut_afs, n=200):
@@ -437,8 +440,8 @@ class Strut:
         self.h = float(p["strut_height"])
         self.rim = float(p.get("strut_rim_round", 0.0))
         self.slot = float(p["strut_slot_depth"])
-        if self.c <= 0 or self.slot <= 0 or self.rim < 0:
-            raise ValueError("Vertical chord and slot depth must be positive, the rim round 0 or more")
+        if self.c <= 0 or self.slot < 0 or self.rim < 0:
+            raise ValueError("Vertical chord must be positive, the slot depth and rim round 0 or more")
         # strut_le_x: LE position aft of the foil nose (bulb nose with a bulb) on the centreline
         self.x_le = float(_surfaces(pf.section(foil_af_for(0.0), 0.0))[0][0][0]) + float(p["strut_le_x"])
         self.x_te = self.x_le + self.c
@@ -469,12 +472,15 @@ class Strut:
         # any slice where there is a slot at all. Normally >= STRUT_MIN_FLOOR_MM;
         # less only right at a blunt nose / tail the vertical overhangs, where
         # the line has to come down to that end's height to leave no gap.
-        self.slot_max = float((top0(on) - self._tenon_z(on)).max())
-        x, z = self.tenon_pts[:, 0], self.tenon_pts[:, 1]
-        floors = [z + 0.1 - low(x) for (top, le, te), (low, _, _) in self._rows]
-        mask = [(x >= le) & (x <= te) & (z < top(x) - 0.2) for (top, le, te), _ in self._rows]
-        vals = np.concatenate([f[k] for f, k in zip(floors, mask)])
-        self.floor = float(vals.min()) if len(vals) else 0.0
+        if self.slot > 0:
+            self.slot_max = float((top0(on) - self._tenon_z(on)).max())
+            x, z = self.tenon_pts[:, 0], self.tenon_pts[:, 1]
+            floors = [z + 0.1 - low(x) for (top, le, te), (low, _, _) in self._rows]
+            mask = [(x >= le) & (x <= te) & (z < top(x) - 0.2) for (top, le, te), _ in self._rows]
+            vals = np.concatenate([f[k] for f, k in zip(floors, mask)])
+            self.floor = float(vals.min()) if len(vals) else 0.0
+        else:
+            self.slot_max = self.floor = 0.0                   # sits on the foil: no slot
 
         h_min = self.z_root + 5.0
         if self.h < h_min:
@@ -487,7 +493,7 @@ class Strut:
             else:
                 bad = self.x_te + margin >= pf.flap()[0]
             if bad:
-                raise ValueError("The vertical's slot overlaps the flap: move it forward, "
+                raise ValueError("The vertical overlaps the flap: move it forward, "
                                  "shorten its chord or turn the flap off")
 
     def _surf_at(self, x):

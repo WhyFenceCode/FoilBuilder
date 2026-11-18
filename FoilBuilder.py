@@ -70,7 +70,7 @@ PARAMS = [
     ("foil_strut_le_x", "strut_le_x", "mm", "Vertical LE aft of the foil nose on the centreline"),
     ("foil_strut_height", "strut_height", "mm", "Height of the vertical's flat top above the foil chord line"),
     ("foil_strut_rim_round", "strut_rim_round", "mm", "Round on the slot rim where the vertical enters the foil (0 = sharp)"),
-    ("foil_strut_slot_depth", "strut_slot_depth", "mm", "Slot depth below the foil top (at least 2 mm of foil is left under it)"),
+    ("foil_strut_slot_depth", "strut_slot_depth", "mm", "Slot depth below the foil top, at least 2 mm of foil left under it (0 = vertical sits on the foil)"),
     ("foil_blend_on", "blend_on", "", "1 = foil rises in a collar round the vertical, 0 = flat slot"),
     ("foil_blend_height", "blend_height", "mm", "Collar height above the foil top at the vertical"),
     ("foil_blend_width", "blend_width", "mm", "How far out from the vertical's sides the collar reaches"),
@@ -422,6 +422,10 @@ def _build_strut(comp, helper, foil, strut, P):
     vert = _loft(comp, profiles)
     ops = adsk.fusion.FeatureOperations
     vert = _combine(comp, vert, _tenon_cutter(comp, helper, st, P), ops.CutFeatureOperation, False)
+    if st.slot <= 0:
+        # no slot: trim the vertical with the foil itself, so its bottom follows
+        # the foil's top surface exactly (also across the crown of the bulb)
+        vert = _combine(comp, vert, foil, ops.CutFeatureOperation, True)
     vert.name = "vertical"
 
     notes = {}
@@ -436,10 +440,14 @@ def _build_strut(comp, helper, foil, strut, P):
             foil = _combine(comp, foil, _loft(comp, profiles, closed), ops.JoinFeatureOperation, False)
         if not runs:
             notes["blend_skipped"] = "no foil round the vertical to blend into"
-    foil = _combine(comp, foil, vert, ops.CutFeatureOperation, True)
+    # the slot; with depth 0 only a blend collar needs cutting back (down to the
+    # foil's own top, where the vertical sits), a plain foil is left whole
+    has_rim = st.slot > 0 or bool(blend)
+    if has_rim:
+        foil = _combine(comp, foil, vert, ops.CutFeatureOperation, True)
     foil.name = "foil"
 
-    if st.rim > 0:
+    if st.rim > 0 and has_rim:
         try:
             _round_slot_rim(comp, foil, st, P)
         except Exception as e:
@@ -579,7 +587,7 @@ STRUT_SPINNERS = (
     ("strut_chord", "Chord (mm)", 10, 400, 1),
     ("strut_le_x", "LE aft of foil nose (mm)", -100, 400, 1),
     ("strut_height", "Top height above chord line (mm)", 10, 2000, 5),
-    ("strut_slot_depth", "Slot depth into foil (mm)", 0.5, 50, 0.5),
+    ("strut_slot_depth", "Slot depth into foil (mm, 0 = sits on top)", 0, 50, 0.5),
     ("strut_rim_round", "Slot rim round (mm, 0 = sharp)", 0, 10, 0.25),
 )
 # blend (collar) spinners, same layout
@@ -658,8 +666,11 @@ def _check(inputs, by_section):
 
 def _strut_line(s):
     """One line describing the vertical, from its summary."""
-    txt = (f"Vertical {s['strut_t']:.1f} mm thick, slot up to {s['strut_slot_max']:.1f} mm deep, "
-           f"at least {s['strut_floor']:.1f} mm of foil under it")
+    if s["strut_slot_max"] > 0:
+        txt = (f"Vertical {s['strut_t']:.1f} mm thick, slot up to {s['strut_slot_max']:.1f} mm deep, "
+               f"at least {s['strut_floor']:.1f} mm of foil under it")
+    else:
+        txt = f"Vertical {s['strut_t']:.1f} mm thick, sitting on the foil (no slot), its bottom following the foil top"
     fwd, aft = s["strut_overhang_fwd"], s["strut_overhang_aft"]
     if fwd > 0 or aft > 0:
         txt += ", overhangs the foil " + " and ".join(
