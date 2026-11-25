@@ -52,8 +52,10 @@ py -3.14 -m pip install --target lib numpy
 - **Δ axis from TE**: where the ellipse axis sits, as a fraction of the root chord measured from the trailing edge.
 
 ### Flap
-- **Split flap** on/off, **Flap / root chord**, and **Flap min chord**: the flap ends where its chord drops below this.
-- With a bulb, the flap is split into port and starboard halves round it.
+- **Split flap** on/off and **Flap / root chord**: where the straight hinge line sits, as the flap's chord at the centreline.
+- The flap is one piece behind the straight hinge line. With a bulb, the hinge line runs straight through it, so the flap carries the bulb's tail. Outboard it runs out until it tapers to nothing, where the trailing edge curves forward across the hinge line (about 95% of the semi-span with the defaults). The info line gives the flap's span. Its outer ends get very thin, down to the trailing-edge thickness.
+- **Flap angle** (default 0°, ±45°, + = trailing edge down): the flap is built deflected by this. It turns as a rigid piece about a straight hinge axis along the hinge line, at the top of the joint between main element and flap on the centreline. Away from the centreline the joint's top edge sits a little lower (the wing is thinner than the bulb's crown), so out there the flap's front edge moves slightly fore or aft as it turns. Turning down, the flap's front face swings forward below the pivot into the main element (the two bodies overlap there); turning up, a wedge opens on the underside.
+- **Join flap into the foil body**: after the split (and the turn), the flap is joined back into the main element as one `foil` body. A deflected flap only touches the main element along the hinge, so if Fusion can't join it, the flap is left as its own body and the message says so.
 
 ### Curved anhedral
 - **Tip drop** (0 = flat) and the **Ellipse semi-axis**, the vertical semi-axis of the ellipse the span line follows.
@@ -72,7 +74,17 @@ Off by default. Tick **Vertical support** to add a vertical (strut) on the centr
   - **0** means no slot: the vertical sits on the foil, and its bottom follows the foil's top surface exactly, including the crown of the bulb across its thickness. The foil isn't cut. With the blend on, the collar is still cut back where the vertical stands, down to the foil's own top, so the vertical sits flush inside the collar.
 - **Slot rim round** (default 0.5 mm, 0 = sharp): rounds the edge of the cutout, which gives the vertical a softer lead-in when you assemble it. With the blend on, this rounds the top of the collar instead (see below). With a slot depth of 0 and no blend there's no cutout, so nothing is rounded. If Fusion can't make the round, the foil is still built with a sharp rim and the message says so.
 
-The info line shows the vertical's thickness, the deepest point of the slot, the least foil left under it, and any overhang. The vertical can't be built if it isn't over the foil at all, if its slot would overlap the flap, or if its top is too low.
+- **Join vertical into the foil body**: the vertical is joined into the foil (the main element when there's a flap) at the end, instead of staying a separate piece. No slot is cut and no rim round is made, since the two become one solid.
+- **Blend foil up into the vertical**: see below. Leave it unticked for a plain vertical in a plain slot.
+
+#### Flap relief
+When the vertical reaches back over the flap, a cutout is made in its back so the flap can deflect up into that space. FoilBuilder takes the flap's profile under the vertical, rotates it about the hinge from 0° up to the maximum angle, and cuts away everything under that swept shape plus the clearance. The slot in the foil then stops ahead of the hinge, so the vertical only holds on the main element and the flap stays free. If the vertical ends ahead of the flap, nothing is cut.
+
+- **Flap relief: max flap up** (default 15°): the largest upward deflection the vertical has to clear. The flap pivots about the top of the joint on the centreline (see [Flap](#flap)). If the flap is built set further up than this, the cutout clears that angle instead.
+- **Flap relief: clearance** (default 1 mm): gap kept between the swept flap and the vertical.
+- **Flap relief: front round** (default 5 mm, 0 = sharp): the front of the cutout is a quarter circle of this radius, reaching forward from the hinge, so there's no sharp inside corner in the vertical.
+
+The info line shows the vertical's thickness, the deepest point of the slot, the least foil left under it, any overhang, and the size of the flap relief. The vertical can't be built if it isn't over the foil at all, if the flap relief would cut away its front, or if its top is too low.
 
 ### Blend into the vertical
 Off by default. Tick **Blend foil up into the vertical** and the foil rises in a collar round the vertical before the cutout is made. The flow then meets the vertical closer to its angle instead of at a sharp 90° corner. The collar is part of the foil body, and the vertical still drops into the slot as a separate piece.
@@ -82,7 +94,7 @@ Off by default. Tick **Blend foil up into the vertical** and the foil rises in a
 - **Blend length ahead of the vertical** and **behind the vertical** (default 6 mm each): how far the collar reaches forward of the vertical's nose and aft of its tail. Lengthen them for a longer, gentler ramp. They apply straight ahead and behind and taper smoothly into the side width, giving a teardrop shape. It gets a little wider than the sides just round the ends.
 - **Blend angle at vertical** (default 25°): the collar's angle where it meets the vertical, measured from vertical. Smaller is closer to tangent. 0 would leave a knife edge at the rim.
 
-The blend never blocks a build. It fades out smoothly where the foil gets thin (towards a nose or tail, or where the vertical overhangs) and before the flap.
+The blend never blocks a build. It fades out smoothly where the foil gets thin (towards a nose or tail, or where the vertical overhangs) and before the flap (or before the vertical's flap relief).
 
 With the blend on, **Slot rim round** rounds the collar's top edge, where it meets the vertical. That edge is a wedge as sharp as the blend angle, so only a small round fits. With the defaults (3 mm high, 25°) that's about 0.5 mm, and a larger blend angle allows more: about 1 mm at 45°. If the round is bigger than that, the info line warns you. If Fusion then can't make it, the build still finishes with a sharp edge.
 
@@ -96,7 +108,7 @@ How it's built: FoilBuilder works out the collar shape itself and lofts it like 
 - **Replace previous foil**: delete the previous FoilBuilder foil before building.
 
 ### The result
-- **Bodies**: `foil`, or `main element` plus `flap` (`flap port` / `flap starboard` with a bulb). With the support on there is also a `vertical` body.
+- **Bodies**: `foil`, or `main element` plus `flap`. With the support on there is also a `vertical` body, unless it's joined into the foil. With the flap joined there's a single `foil` body.
 - **Timeline**: the features are grouped as **"FoilBuilder: Foil …"**.
 - **Assembly** (or classic) documents: the foil goes in its own component, **"Foil …"**.
 - **Part Design** documents (one component only): it's built directly in the part.
@@ -117,11 +129,12 @@ Every dialog value is saved in the design as a Fusion **user parameter** with a 
 | Group | Parameters |
 |---|---|
 | Planform | `foil_span`, `foil_area_cm2`, `foil_delta` |
-| Flap | `foil_flap_on`, `foil_flap_frac`, `foil_flap_min_chord` |
+| Flap | `foil_flap_on`, `foil_flap_frac`, `foil_flap_angle`, `foil_join_flap` |
 | Anhedral | `foil_anhedral_depth`, `foil_anhedral_semiaxis` |
 | Advanced | `foil_n_half`, `foil_tip_eta`, `foil_te_thick_pct` |
 | Bulb | `foil_bulb_on`, `foil_bulb_length`, `foil_bulb_nose_frac`, `foil_bulb_thickness`, `foil_bulb_half_width` |
-| Vertical | `foil_strut_on`, `foil_strut_chord`, `foil_strut_le_x`, `foil_strut_height`, `foil_strut_slot_depth`, `foil_strut_rim_round` |
+| Vertical | `foil_strut_on`, `foil_strut_chord`, `foil_strut_le_x`, `foil_strut_height`, `foil_strut_slot_depth`, `foil_strut_rim_round`, `foil_join_strut` |
+| Flap relief | `foil_strut_flap_up_deg`, `foil_strut_relief_clear`, `foil_strut_relief_round` |
 | Blend | `foil_blend_on`, `foil_blend_height`, `foil_blend_width`, `foil_blend_front_width`, `foil_blend_back_width`, `foil_blend_wall_angle` |
 
 On/off values are `1` or `0`. The airfoil files and their η positions, and the vertical axis, are stored in the design too, but not as parameters. To change those, run the dialog again.

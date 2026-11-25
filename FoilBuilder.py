@@ -54,7 +54,6 @@ PARAMS = [
     ("foil_delta", "delta", "", "Ellipse axis position from TE, fraction of root chord"),
     ("foil_flap_on", "flap_on", "", "1 = split a flap, 0 = no flap"),
     ("foil_flap_frac", "flap_frac", "", "Flap chord / root chord (straight hinge)"),
-    ("foil_flap_min_chord", "flap_min_chord", "mm", "Flap ends where its chord drops below this"),
     ("foil_anhedral_depth", "anhedral_depth", "mm", "Tip drop of curved anhedral (0 = flat)"),
     ("foil_anhedral_semiaxis", "anhedral_semiaxis", "mm", "Vertical semi-axis of anhedral ellipse"),
     ("foil_n_half", "n_half", "", "Sections per half span"),
@@ -77,8 +76,14 @@ PARAMS = [
     ("foil_blend_front_width", "blend_front_width", "mm", "How far ahead of the vertical the collar reaches"),
     ("foil_blend_back_width", "blend_back_width", "mm", "How far behind the vertical the collar reaches"),
     ("foil_blend_wall_angle", "blend_wall_angle", "", "Collar angle at the vertical, deg from vertical (0 = tangent)"),
+    ("foil_strut_flap_up_deg", "strut_flap_up_deg", "", "Flap relief: largest upward flap deflection the vertical clears, deg"),
+    ("foil_flap_angle", "flap_angle", "", "Flap built deflected by this, deg about the top of the joint (+ = TE down)"),
+    ("foil_strut_relief_clear", "strut_relief_clear", "mm", "Flap relief: clearance between the swept flap and the vertical"),
+    ("foil_strut_relief_round", "strut_relief_round", "mm", "Flap relief: radius of the rounded front of the cutout (0 = sharp)"),
+    ("foil_join_strut", "join_strut", "", "1 = vertical joined into the foil body, 0 = separate body in a slot"),
+    ("foil_join_flap", "join_flap", "", "1 = flap joined back into the foil body, 0 = separate flap body"),
 ]
-BOOL_KEYS = ("flap_on", "bulb_on", "strut_on", "blend_on")
+BOOL_KEYS = ("flap_on", "bulb_on", "strut_on", "blend_on", "join_strut", "join_flap")
 
 _app = None
 _ui = None
@@ -404,13 +409,16 @@ def _combine(comp, target, tool, op, keep_tool, feature=False):
     return feat if feature else feat.bodies.item(0)
 
 
-def _build_strut(comp, helper, foil, strut, P):
+def _build_strut(comp, helper, foil, strut, P, join=False):
     """Vertical support: a straight loft from the slot bottom to its flat top,
-    kept as its own body. With a blend, a collar lofted from fillet-style
-    slices round the vertical is first joined to the foil. Then the vertical's
-    shape is cut out of the foil as the slot, and the slot rim (with a blend:
-    the top of the collar) is optionally rounded, as a lead-in for assembly.
-    Returns (slotted foil, vertical, notes)."""
+    kept as its own body. Where it reaches back over the flap, a rounded
+    relief is cut out of its back so the flap can deflect up into it. With a
+    blend, a collar lofted from fillet-style slices round the vertical is
+    first joined to the foil. Then the vertical's shape is cut out of the foil
+    as the slot, and the slot rim (with a blend: the top of the collar) is
+    optionally rounded, as a lead-in for assembly. join: the vertical will be
+    joined into the foil later, so no slot is cut and no rim rounded.
+    Returns (foil, vertical, notes)."""
     st, af_at, etas, blend = strut
     # One smooth closed loop per section (tiny rounded TE): a flat TE strip
     # would leave two sharp corners in the slot rim, which can't be rounded.
@@ -421,11 +429,16 @@ def _build_strut(comp, helper, foil, strut, P):
                                          f"vertical z={z:.1f}", smooth_te=True))
     vert = _loft(comp, profiles)
     ops = adsk.fusion.FeatureOperations
-    vert = _combine(comp, vert, _tenon_cutter(comp, helper, st, P), ops.CutFeatureOperation, False)
+    vert = _combine(comp, vert, _side_cutter(comp, helper, st, st.tenon_pts, st.z_bot - 5.0, P,
+                                             "vertical tenon line"), ops.CutFeatureOperation, False)
     if st.slot <= 0:
         # no slot: trim the vertical with the foil itself, so its bottom follows
         # the foil's top surface exactly (also across the crown of the bulb)
         vert = _combine(comp, vert, foil, ops.CutFeatureOperation, True)
+    if st.relief is not None:
+        # flap relief, before the slot is cut: the slot then stops ahead of it
+        vert = _combine(comp, vert, _side_cutter(comp, helper, st, st.relief, st.relief_zb, P,
+                                                 "vertical flap relief"), ops.CutFeatureOperation, False)
     vert.name = "vertical"
 
     notes = {}
@@ -442,7 +455,7 @@ def _build_strut(comp, helper, foil, strut, P):
             notes["blend_skipped"] = "no foil round the vertical to blend into"
     # the slot; with depth 0 only a blend collar needs cutting back (down to the
     # foil's own top, where the vertical sits), a plain foil is left whole
-    has_rim = st.slot > 0 or bool(blend)
+    has_rim = (st.slot > 0 or bool(blend)) and not join
     if has_rim:
         foil = _combine(comp, foil, vert, ops.CutFeatureOperation, True)
     foil.name = "foil"
@@ -455,20 +468,20 @@ def _build_strut(comp, helper, foil, strut, P):
     return foil, vert, notes
 
 
-def _tenon_cutter(comp, helper, st, P):
-    """Body that trims the vertical's bottom to its tenon line: the line
-    (a spline in the centreline plane) down to below the vertical's loft,
-    extruded across the vertical's thickness."""
+def _side_cutter(comp, helper, st, pts, zb, P, name):
+    """Body that cuts away everything of the vertical below a line in side
+    view: pts ((n, 2) x, z, front to back) as a spline in the centreline
+    plane, closed down to zb, extruded across the vertical's thickness.
+    Used for the tenon line (the vertical's bottom) and the flap relief."""
     plane = _plane_through(comp, helper, P(0.0, 0.0, 0.0), P(10.0, 0.0, 0.0), P(0.0, 0.0, 10.0))
     sk = _tag(comp.sketches.add(plane))
-    sk.name = "vertical tenon line"
+    sk.name = name
     sk.isComputeDeferred = True
     coll = adsk.core.ObjectCollection.create()
-    for x, z in st.tenon_pts:
+    for x, z in pts:
         coll.add(sk.modelToSketchSpace(P(x, 0.0, z)))
     spl = sk.sketchCurves.sketchFittedSplines.add(coll)
-    (x0, _), (x1, _) = st.tenon_pts[0], st.tenon_pts[-1]
-    zb = st.z_bot - 5.0
+    (x0, _), (x1, _) = pts[0], pts[-1]
     a, b = sk.modelToSketchSpace(P(x1, 0.0, zb)), sk.modelToSketchSpace(P(x0, 0.0, zb))
     lines = sk.sketchCurves.sketchLines
     l1 = lines.addByTwoPoints(spl.endSketchPoint, a)
@@ -476,7 +489,7 @@ def _tenon_cutter(comp, helper, st, P):
     lines.addByTwoPoints(l2.endSketchPoint, spl.startSketchPoint)
     sk.isComputeDeferred = False
     if sk.profiles.count != 1:
-        raise RuntimeError(f"Vertical tenon line gave {sk.profiles.count} profiles")
+        raise RuntimeError(f"{name} gave {sk.profiles.count} profiles")
     sk.isVisible = False
     ext = comp.features.extrudeFeatures
     ei = ext.createInput(sk.profiles.item(0), adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
@@ -515,6 +528,29 @@ def _round_slot_rim(comp, foil, st, P):
     _tag(fillets.add(fi))
 
 
+def _rotate_flaps(comp, flaps, pivot, angle_deg, P):
+    """Turn the flap bodies about the hinge axis: along the foil's y through
+    pivot (x, z in foil mm), by angle_deg, + = TE down. A turn about +y takes
+    +x towards -z (TE down); the foil -> model mapping is a proper rotation,
+    so the same holds in model space."""
+    x, z = pivot
+    o, e = P(x, 0.0, z), P(x, 10.0, z)
+    axis = adsk.core.Vector3D.create(e.x - o.x, e.y - o.y, e.z - o.z)
+    axis.normalize()
+    m = adsk.core.Matrix3D.create()
+    m.setToRotation(math.radians(angle_deg), axis, o)
+    coll = adsk.core.ObjectCollection.create()
+    for b in flaps:
+        coll.add(b)
+    moves = comp.features.moveFeatures
+    try:
+        mi = moves.createInput2(coll)
+        mi.defineAsFreeMove(m)
+    except AttributeError:                       # older API
+        mi = moves.createInput(coll, m)
+    _tag(moves.add(mi))
+
+
 def _build_geometry(design, comp, af_for, pf, P, extra_eta=(), strut=None):
     """af_for(y) -> unit-chord Selig points of the airfoil at span station y.
     strut: None or (G.Strut, af_at(eta), etas) for the vertical support."""
@@ -535,9 +571,13 @@ def _build_geometry(design, comp, af_for, pf, P, extra_eta=(), strut=None):
 
     # ---- vertical support (before the flap split, which only touches the foil)
     notes = {}
+    vert = None
+    join_strut = bool(pf.p.get("join_strut")) and strut is not None
     if strut:
-        foil, _, notes = _build_strut(comp, helper, foil, strut, P)
+        foil, vert, notes = _build_strut(comp, helper, foil, strut, P, join=join_strut)
     helper.isVisible = False
+    ops = adsk.fusion.FeatureOperations
+    main, flaps = foil, []
 
     # ---- flap split (straight hinge line)
     poly = pf.flap_cutter_polygon()
@@ -559,23 +599,31 @@ def _build_geometry(design, comp, af_for, pf, P, extra_eta=(), strut=None):
         si = comp.features.splitBodyFeatures.createInput(foil, cutter, False)
         split = _tag(comp.features.splitBodyFeatures.add(si))
         _tag(comp.features.removeFeatures.add(cutter))
-        # name the pieces: flaps start at the hinge line; with a bulb there are
-        # two flap halves, named by which side of the centreline they are on
+        # name the pieces: the flap starts at the hinge line (model x is foil x)
         x_h_model = x_h * MM2CM
-        o, e = P(0, 0, 0), P(0, 10, 0)
-        d = (e.x - o.x, e.y - o.y, e.z - o.z)                 # foil +y direction
         for i in range(split.bodies.count):
             b = split.bodies.item(i)
-            bb = b.boundingBox
-            if bb.minPoint.x < x_h_model - 1e-3:
+            if b.boundingBox.minPoint.x < x_h_model - 1e-3:
                 b.name = "main element"
-            elif pf.bulb_on:
-                cy = sum(0.5 * (a + c_) * k for a, c_, k in zip(
-                    (bb.minPoint.x, bb.minPoint.y, bb.minPoint.z),
-                    (bb.maxPoint.x, bb.maxPoint.y, bb.maxPoint.z), d))
-                b.name = "flap starboard" if cy > 0 else "flap port"
+                main = b
             else:
                 b.name = "flap"
+                flaps.append(b)
+        angle = pf.flap_angle()
+        if flaps and abs(angle) > 1e-6:
+            _rotate_flaps(comp, flaps, pf.flap_pivot(af_for(0.0)), angle, P)
+
+    # ---- optional unions, last, so the split and the relief are made first
+    if vert is not None and join_strut:
+        main = _combine(comp, main, vert, ops.JoinFeatureOperation, False)
+    if flaps and pf.p.get("join_flap"):
+        try:
+            for b in flaps:
+                main = _combine(comp, main, b, ops.JoinFeatureOperation, False)
+            flaps = []
+        except Exception as e:
+            notes["flap_join_failed"] = f"{e}".splitlines()[0]
+    main.name = "main element" if flaps else "foil"
     return notes
 
 
@@ -589,6 +637,9 @@ STRUT_SPINNERS = (
     ("strut_height", "Top height above chord line (mm)", 10, 2000, 5),
     ("strut_slot_depth", "Slot depth into foil (mm, 0 = sits on top)", 0, 50, 0.5),
     ("strut_rim_round", "Slot rim round (mm, 0 = sharp)", 0, 10, 0.25),
+    ("strut_flap_up_deg", "Flap relief: max flap up (deg)", 0, 75, 1),
+    ("strut_relief_clear", "Flap relief: clearance (mm)", 0, 10, 0.25),
+    ("strut_relief_round", "Flap relief: front round (mm, 0 = sharp)", 0, 50, 0.5),
 )
 # blend (collar) spinners, same layout
 BLEND_SPINNERS = (
@@ -600,7 +651,7 @@ BLEND_SPINNERS = (
 )
 # inputs shown only while the vertical support is ticked
 STRUT_IDS = ("strut_help", "strut_table", "strut_add", "strut_remove", "strut_browse",
-             "strut_dat_path", "blend_on") + tuple(s[0] for s in STRUT_SPINNERS)
+             "strut_dat_path", "blend_on", "join_strut") + tuple(s[0] for s in STRUT_SPINNERS)
 # section table buttons -> table
 ADD_BUTTONS = {"sec_add": "sec_table", "strut_add": "strut_table"}
 REMOVE_BUTTONS = {"sec_remove": "sec_table", "strut_remove": "strut_table"}
@@ -637,7 +688,10 @@ def _check(inputs, by_section):
         s = G.Planform(p).summary()
         txt = f"Root chord {s['c_root']:.1f} mm, AR {s['AR']:.1f}"
         if "x_hinge" in s:
-            txt += f", flap span {s['flap_span']:.0f} mm"
+            txt += (", flap to the tips" if s["flap_to_tip"] else
+                    f", flap span {s['flap_span']:.0f} mm (as far as the straight hinge reaches)")
+            if s["flap_angle"]:
+                txt += f" at {abs(s['flap_angle']):g} deg {'down' if s['flap_angle'] > 0 else 'up'}"
         if "tip_drop" in s:
             txt += f", tip slope {s['tip_slope_deg']:.1f} deg"
         if "bulb_length" in s:
@@ -655,7 +709,7 @@ def _check(inputs, by_section):
             if strut[3]:
                 lines.append(_blend_line(strut[3].summary()))
                 limit = strut[3].rim_round_limit()
-                if strut[0].rim > limit:
+                if strut[0].rim > limit and not p.get("join_strut"):
                     lines.append(f"<i>A slot rim round over about {limit:.2f} mm may not fit on this blend's "
                                  "sharp top edge (it would then be skipped): use a smaller round, or a larger "
                                  "blend angle.</i>")
@@ -675,6 +729,9 @@ def _strut_line(s):
     if fwd > 0 or aft > 0:
         txt += ", overhangs the foil " + " and ".join(
             f"{v:.0f} mm {w}" for v, w in ((fwd, "ahead"), (aft, "behind")) if v > 0)
+    if "strut_relief_len" in s:
+        txt += (f"; flap relief cut from its last {s['strut_relief_len']:.0f} mm, up to "
+                f"{s['strut_relief_rise']:.1f} mm above the foil top at the hinge")
     return txt
 
 
@@ -696,20 +753,20 @@ def _params_from_inputs(inputs):
     p = dict(
         span=g("span").value, area_cm2=g("area_cm2").value, delta=g("delta").value,
         flap_on=g("flap_on").value, flap_frac=g("flap_frac").value,
-        flap_min_chord=g("flap_min_chord").value, anhedral_depth=g("anhedral_depth").value,
+        flap_angle=g("flap_angle").value, anhedral_depth=g("anhedral_depth").value,
         anhedral_semiaxis=g("anhedral_semiaxis").value, n_half=g("n_half").value,
         tip_eta=g("tip_eta").value, te_thick_pct=g("te_thick_pct").value,
         bulb_on=g("bulb_on").value, bulb_length=g("bulb_length").value,
         bulb_nose_frac=g("bulb_nose_frac").value, bulb_thickness=g("bulb_thickness").value,
         bulb_half_width=g("bulb_half_width").value, strut_on=g("strut_on").value,
-        blend_on=g("blend_on").value)
+        blend_on=g("blend_on").value, join_strut=g("join_strut").value, join_flap=g("join_flap").value)
     for key, *_ in STRUT_SPINNERS + BLEND_SPINNERS:
         p[key] = g(key).value
     return p
 
 
 def _set_inputs(inputs, p):
-    for key in ("span", "area_cm2", "delta", "flap_frac", "flap_min_chord", "anhedral_depth",
+    for key in ("span", "area_cm2", "delta", "flap_frac", "anhedral_depth",
                 "anhedral_semiaxis", "tip_eta", "te_thick_pct", "bulb_length", "bulb_nose_frac",
                 "bulb_thickness", "bulb_half_width"):
         inputs.itemById(key).value = float(p.get(key, G.DEFAULTS[key]))
@@ -821,7 +878,11 @@ class BuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
             g = inputs.addGroupCommandInput("g_flap", "Flap").children
             g.addBoolValueInput("flap_on", "Split flap", True, "", bool(p["flap_on"]))
             g.addFloatSpinnerCommandInput("flap_frac", "Flap / root chord", "", 0.05, 0.6, 0.01, p["flap_frac"])
-            g.addFloatSpinnerCommandInput("flap_min_chord", "Flap min chord (mm)", "", 1, 50, 1, p["flap_min_chord"])
+            g.addFloatSpinnerCommandInput("flap_angle", "Flap angle (deg, + = TE down)", "",
+                                          -G.FLAP_ANGLE_MAX, G.FLAP_ANGLE_MAX, 1,
+                                          float(p.get("flap_angle", 0.0)))
+            g.addBoolValueInput("join_flap", "Join flap into the foil body", True, "",
+                                bool(p.get("join_flap", False)))
 
             g = inputs.addGroupCommandInput("g_anh", "Curved anhedral").children
             g.addFloatSpinnerCommandInput("anhedral_depth", "Tip drop (mm, 0 = flat)", "", 0, 300, 1, p["anhedral_depth"])
@@ -852,6 +913,8 @@ class BuildCreatedHandler(adsk.core.CommandCreatedEventHandler):
             for key, label, lo, hi, step in STRUT_SPINNERS:
                 g.addFloatSpinnerCommandInput(key, label, "", lo, hi, step,
                                               float(p.get(key, G.DEFAULTS[key])))
+            g.addBoolValueInput("join_strut", "Join vertical into the foil body", True, "",
+                                bool(p.get("join_strut", False)))
             g.addBoolValueInput("blend_on", "Blend foil up into the vertical", True, "",
                                 bool(p.get("blend_on", False)))
             for key, label, lo, hi, step in BLEND_SPINNERS:
@@ -949,6 +1012,10 @@ def _built_message(name, s):
         msg += "\n" + _blend_line(s) + "."
     if "blend_skipped" in s:
         msg += f"\nNo blend was made: {s['blend_skipped']}."
+    if "flap_join_failed" in s:
+        msg += ("\nThe flap could not be joined into the foil at this angle and was left as its own body "
+                f"(a deflected flap only touches the main element along the hinge).\nFusion said: "
+                f"{s['flap_join_failed']}")
     if "rim_round_failed" in s:
         msg += ("\nThe slot rim round was skipped (Fusion could not make it); the rim is sharp. "
                 f"Try a smaller rim round.\nFusion said: {s['rim_round_failed']}")

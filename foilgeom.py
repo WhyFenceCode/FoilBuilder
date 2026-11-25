@@ -12,8 +12,10 @@ placed DELTA * c_root ahead of the root TE:
 Anhedral (optional, "banana" foil): span line is an elliptical arc
     z(y) = -E_V * (1 - sqrt(1 - (y/E_H)^2)),  E_H solved for the tip drop.
 Sections are rotated about x to stay perpendicular to the span line.
-Flap (optional): straight hinge line at FLAP_FRAC * c_root ahead of the root
-TE, ending where the local flap chord drops to FLAP_MIN_CHORD.
+Flap (optional): one piece behind a straight hinge line at FLAP_FRAC * c_root
+ahead of the root TE, running through the bulb (so it carries the bulb's tail)
+and running out each side until it tapers to nothing where the TE crosses
+the hinge line.
 Sections (optional): SectionedAirfoil blends several airfoils placed at
 fractions of the semi-span, so the section shape can change along the span.
 """
@@ -203,18 +205,24 @@ TE_MIN_MM = 0.05
 
 PRESETS = {
     "Bonetti main foil (E393)": dict(span=1150.0, area_cm2=960.0, delta=0.43, flap_on=True,
-                                     flap_frac=0.30, flap_min_chord=10.0, anhedral_depth=0.0,
+                                     flap_frac=0.30, anhedral_depth=0.0,
                                      anhedral_semiaxis=65.0, n_half=18, tip_eta=0.998,
                                      te_thick_pct=0.4, bulb_on=True, bulb_length=200.0,
                                      bulb_nose_frac=0.6, bulb_thickness=24.0, bulb_half_width=30.0),
     "Bonetti rudder foil (E393)": dict(span=800.0, area_cm2=400.0, delta=0.30, flap_on=False,
-                                       flap_frac=0.30, flap_min_chord=10.0, anhedral_depth=40.0,
+                                       flap_frac=0.30, anhedral_depth=40.0,
                                        anhedral_semiaxis=65.0, n_half=18, tip_eta=0.998,
                                        te_thick_pct=0.4, bulb_on=True, bulb_length=170.0,
                                        bulb_nose_frac=0.6, bulb_thickness=17.0, bulb_half_width=25.0),
 }
 STRUT_DEFAULTS = dict(strut_on=False, strut_chord=80.0, strut_le_x=25.0, strut_height=150.0,
-                      strut_rim_round=0.5, strut_slot_depth=5.0)
+                      strut_rim_round=0.5, strut_slot_depth=5.0, strut_flap_up_deg=15.0,
+                      strut_relief_clear=1.0, strut_relief_round=5.0)
+JOIN_DEFAULTS = dict(join_strut=False, join_flap=False)   # union the pieces into one body at the end
+FLAP_DEFAULTS = dict(flap_angle=0.0)   # deg the flap is built deflected, + = TE down
+FLAP_ANGLE_MAX = 45.0
+RELIEF_GRID_MM = 0.25         # x bins of the flap's swept envelope
+RELIEF_STEP_MM = 1.0          # spacing of the relief outline handed to CAD
 STRUT_MIN_FLOOR_MM = 2.0      # foil material left under the slot
 STRUT_TE_MIN_MM = 0.5         # vertical's TE thickness (rounded off in CAD)
 BLEND_DEFAULTS = dict(blend_on=False, blend_height=3.0, blend_width=6.0, blend_front_width=6.0,
@@ -235,6 +243,8 @@ BLEND_GRID_MM = 0.05          # x spacing of the foil-surface table the blend lo
 DEFAULTS = dict(PRESETS["Bonetti main foil (E393)"])
 DEFAULTS.update(STRUT_DEFAULTS)
 DEFAULTS.update(BLEND_DEFAULTS)
+DEFAULTS.update(JOIN_DEFAULTS)
+DEFAULTS.update(FLAP_DEFAULTS)
 
 
 class Planform:
@@ -268,6 +278,8 @@ class Planform:
                 raise ValueError("Bulb nose fraction must be between 0 and 1")
             if self.bulb_t <= 0:
                 raise ValueError("Bulb thickness must be positive")
+        if abs(float(p.get("flap_angle", 0.0))) > FLAP_ANGLE_MAX:
+            raise ValueError(f"Flap angle must be within +-{FLAP_ANGLE_MAX:g} deg")
         self._taf = {}
 
     # span line
@@ -318,33 +330,41 @@ class Planform:
         return self._taf[k]
 
     def flap(self):
-        """(x_hinge, y_flap_half) or None."""
-        if not self.p.get("flap_on"):
+        """(x_hinge, y_flap_half) or None. The flap runs out along its straight
+        hinge until it tapers to nothing, where the TE crosses the hinge line
+        (or to the tip, for a hinge at or ahead of the ellipse axis)."""
+        if not self.p.get("flap_on") or float(self.p["flap_frac"]) <= 0:
             return None
         x_te_root = self.delta * self.c_root
         x_h = x_te_root - float(self.p["flap_frac"]) * self.c_root
-        s_min = (x_h + float(self.p["flap_min_chord"])) / x_te_root
-        if s_min >= 1.0:
-            return None
-        return x_h, self.b2 * math.sqrt(1.0 - s_min * s_min)
+        s = max(x_h, 0.0) / x_te_root
+        return x_h, self.b2 * math.sqrt(1.0 - s * s)
 
     def flap_cutter_polygon(self):
-        """Planform polygon (x, y) in mm of the flap cutter, or None.
-        With a bulb, the cutter goes round the bulb tail, giving port and
-        starboard flap halves that start where the bulb has blended out."""
+        """Planform polygon (x, y) in mm of the flap cutter, or None: everything
+        aft of the hinge line, past both ends of the foil, so one flap that runs
+        out as far as the hinge allows and also takes the tail of the bulb."""
         f = self.flap()
         if not f:
             return None
-        x_h, y_f = f
+        x_h = f[0]
         x_far = self.delta * self.c_root + self.bulb_dL + 300.0
-        if not self.bulb_on:
-            return [(x_h, -y_f), (x_far, -y_f), (x_far, y_f), (x_h, y_f)]
-        y_in = self.bulb_w
-        if y_in >= y_f:
-            return None
-        x_t = self.bulb_tail_x() + 5.0
-        return [(x_h, -y_f), (x_far, -y_f), (x_far, y_f), (x_h, y_f),
-                (x_h, y_in), (x_t, y_in), (x_t, -y_in), (x_h, -y_in)]
+        y_out = self.b2 + 20.0
+        return [(x_h, -y_out), (x_far, -y_out), (x_far, y_out), (x_h, y_out)]
+
+    def flap_pivot(self, af0):
+        """(x, z) of the flap's hinge axis, which runs along y: the top of the
+        joint between main element and flap, on the centreline (af0: the
+        centreline airfoil). The flap is rigid, so this one straight axis
+        serves the whole span; away from the centreline the joint's top edge
+        may sit a little lower (thinner wing, below the bulb's crown)."""
+        x_h = self.flap()[0]
+        (ux, uz), _ = _surfaces(self.section(af0, 0.0))
+        return x_h, float(_row_spline(ux, uz)[0](x_h))
+
+    def flap_angle(self):
+        """Angle the flap is built at, deg (+ = TE down), or 0 without a flap."""
+        return float(self.p.get("flap_angle", 0.0)) if self.flap_cutter_polygon() else 0.0
 
     def section(self, af, y):
         """(n, 3) array (mm) of the section at span station y, Selig order."""
@@ -377,7 +397,10 @@ class Planform:
             s["tip_drop"] = -self.z_span(self.b2)[0]
             s["tip_slope_deg"] = math.degrees(math.atan(abs(self.z_span(y_t)[1])))
         if f:
-            s["x_hinge"], s["flap_span"] = f[0], 2 * f[1]
+            s["x_hinge"] = f[0]
+            s["flap_span"] = 2 * min(f[1], float(self.p["tip_eta"]) * self.b2)
+            s["flap_to_tip"] = f[1] >= float(self.p["tip_eta"]) * self.b2
+            s["flap_angle"] = self.flap_angle()
         if self.bulb_on:
             s["bulb_length"] = self.c_root + self.bulb_dL
             s["bulb_nose_ahead_of_le"] = self.bulb_dL * self.bulb_nose
@@ -433,6 +456,9 @@ class Strut:
     strut_slot_depth 0: no slot. The vertical sits on the foil, its bottom
     following the foil's top surface exactly (CAD trims it with the foil
     body itself); the tenon line then only trims an overhang.
+    Where it reaches back over the flap, a rounded relief is cut out of its
+    back so the flap can deflect up into it (see _flap_relief); the slot then
+    stops ahead of the hinge, so the vertical only holds on the main element.
     eta = 0 at the highest point of the foil top under the vertical, 1 at its top."""
 
     def __init__(self, p, pf, foil_af_for, strut_afs, n=200):
@@ -485,16 +511,79 @@ class Strut:
         h_min = self.z_root + 5.0
         if self.h < h_min:
             raise ValueError(f"Vertical height must be at least {h_min:.0f} mm (foil top + 5 mm)")
+
+        # flap relief: where the vertical reaches back over the flap, the part
+        # of it the flap sweeps through (deflecting up) is cut away
+        self.relief = None
+        self.relief_x0 = None
         if pf.flap_cutter_polygon():
-            margin = self.rim + 1.0
-            if pf.bulb_on:
-                bad = (self.half_t + margin >= pf.bulb_w
-                       or self.x_te + margin >= pf.bulb_tail_x() + 5.0)
-            else:
-                bad = self.x_te + margin >= pf.flap()[0]
-            if bad:
-                raise ValueError("The vertical overlaps the flap: move it forward, "
-                                 "shorten its chord or turn the flap off")
+            self._flap_relief(p, pf.flap()[0])
+
+    def _flap_relief(self, p, x_h):
+        """Side-view (x, z) outline of the cutout in the vertical's back that
+        lets the flap deflect up into it. The flap's profile under the
+        vertical (highest across its thickness) is rotated about the flap
+        pivot (the top of the joint on the centreline, see flap_pivot) from 0
+        up to strut_flap_up_deg, or to the flap's set angle if that is further
+        up; the cutout is everything under that swept
+        envelope plus strut_relief_clear. Its front corner is rounded by a
+        quarter circle of radius strut_relief_round that reaches forward from
+        the hinge, so there is no sharp inside corner in the vertical.
+        Sets self.relief ((n, 2) array, front to back; the CAD side closes it
+        below self.relief_zb), self.relief_x0 (front of the cutout), or leaves
+        them None when the vertical stays clear of the flap."""
+        up = math.radians(float(p.get("strut_flap_up_deg", 15.0)))
+        clr = float(p.get("strut_relief_clear", 1.0))
+        R = float(p.get("strut_relief_round", 5.0))
+        if not 0.0 <= up < math.radians(80.0) or clr < 0 or R < 0:
+            raise ValueError("Flap relief: up angle 0-80 deg, clearance and round 0 or more")
+        up = max(up, -math.radians(float(p.get("flap_angle", 0.0))))   # a flap set up counts too
+        (top0, le0, te0), (low0, _, _) = self._rows[0]
+        if not le0 < x_h < te0:
+            return
+        # flap silhouette under the vertical: front face, then the top surface
+        xs = np.linspace(x_h, te0, max(int((te0 - x_h) / 0.2), 2) + 1)
+        top = np.max([f(np.clip(xs, le, te)) for (f, le, te), _ in self._rows], axis=0)
+        z_lo = float(low0(x_h))
+        z_h = float(top0(x_h))                              # pivot: top of the joint, centreline
+        n_f = max(int((top[0] - z_lo) / 0.2), 2)
+        cx = np.r_[np.full(n_f, x_h), xs]
+        cz = np.r_[np.linspace(z_lo, top[0], n_f, endpoint=False), top]
+        th = np.linspace(0.0, up, max(int(math.ceil(math.degrees(up) / 0.5)), 1) + 1)[:, None]
+        dx, dz = cx - x_h, cz - z_h
+        X = (x_h + dx * np.cos(th) - dz * np.sin(th)).ravel()
+        Z = (z_h + dx * np.sin(th) + dz * np.cos(th)).ravel()
+        x_a = float(X.min()) - clr                          # front of the swept region + clearance
+        if self.x_te <= x_a:
+            return                                          # vertical ends ahead of the flap
+        # upper envelope on an x grid (max per bin, gaps interpolated, constant
+        # beyond either end), plus clearance; then made a little conservative
+        # by a running max before thinning it out for CAD
+        x_end = max(self.x_te, float(X.max())) + 3.0
+        gx = np.arange(x_a, x_end + RELIEF_GRID_MM, RELIEF_GRID_MM)
+        env = np.full(len(gx), -np.inf)
+        np.maximum.at(env, np.clip(((X - x_a) / RELIEF_GRID_MM).astype(int), 0, len(gx) - 1), Z)
+        ok = np.isfinite(env)
+        env = np.interp(gx, gx[ok], env[ok]) + clr
+        w = int(RELIEF_STEP_MM / RELIEF_GRID_MM)
+        pad = np.r_[np.full(w, env[0]), env, np.full(w, env[-1])]
+        env = np.max([pad[k:k + len(env)] for k in range(2 * w + 1)], axis=0)
+        k = np.unique(np.r_[np.arange(0, len(gx), w), len(gx) - 1])
+        line = np.column_stack([gx[k], env[k]])
+        e0 = float(env[0])
+        if R > 0:                                           # rounded front: vertical tangent at x_a - R
+            a = np.linspace(math.pi, 0.5 * math.pi, 10)[:-1]
+            arc = np.column_stack([x_a + R * np.cos(a), e0 - R + R * np.sin(a)])
+            line = np.vstack([arc, line])
+        self.relief_x0 = x_a - R
+        self.relief_zb = min(self.z_bot, e0 - R) - 5.0
+        if self.relief_x0 < self.x_le + 5.0:
+            raise ValueError("The flap relief would cut away the front of the vertical: move it "
+                             "forward, shorten its chord, or reduce the flap relief settings")
+        if float(env.max()) > self.h - 5.0:
+            raise ValueError("The flap relief reaches the vertical's top: make it taller")
+        self.relief = line
+        self.relief_rise = float(env[gx <= self.x_te].max()) - float(top[0])   # above the foil top at the hinge
 
     def _surf_at(self, x):
         """(lowest foil top, highest foil bottom) at x (array) across the
@@ -544,9 +633,13 @@ class Strut:
         return np.column_stack([x, y, np.full(len(x), float(z))])
 
     def summary(self):
-        return {"strut_t": 2 * self.half_t, "strut_floor": self.floor, "strut_slot_max": self.slot_max,
-                "strut_z_root": self.z_root, "strut_overhang_fwd": self.overhang[0],
-                "strut_overhang_aft": self.overhang[1]}
+        s = {"strut_t": 2 * self.half_t, "strut_floor": self.floor, "strut_slot_max": self.slot_max,
+             "strut_z_root": self.z_root, "strut_overhang_fwd": self.overhang[0],
+             "strut_overhang_aft": self.overhang[1]}
+        if self.relief is not None:
+            s["strut_relief_len"] = self.x_te - self.relief_x0
+            s["strut_relief_rise"] = self.relief_rise
+        return s
 
 
 class Blend:
@@ -628,11 +721,11 @@ class Blend:
         self._T = np.array([f(self._gx) for f, _, _ in self._top])     # (rows, n)
         self._B = np.array([f(self._gx) for f, _, _ in self._low])
 
-        # where the flap is split off (the blend fades out before it)
-        self._flap = None
+        # where the flap is split off, or the vertical's flap relief starts
+        # (the blend fades out before it)
+        self._x_stop = None
         if pf.flap_cutter_polygon():
-            x_h = pf.flap()[0]
-            self._flap = (x_h, pf.bulb_w, pf.bulb_tail_x() + 5.0) if pf.bulb_on else (x_h, None, None)
+            self._x_stop = st.relief_x0 if st.relief is not None else pf.flap()[0]
 
         self._stations = self._place_stations()
 
@@ -714,10 +807,8 @@ class Blend:
     def _fade(self, x, y, thick):
         lo, hi = BLEND_FADE_MM
         f = _smoothstep((thick - lo) / (hi - lo))
-        if self._flap:
-            x_h, y_b, x_t = self._flap
-            room = x_h - x if y_b is None else np.minimum(np.maximum(x_h - x, y_b - np.abs(y)), x_t - x)
-            f = f * _smoothstep((room - 1.0) / 4.0)
+        if self._x_stop is not None:
+            f = f * _smoothstep((self._x_stop - x - 1.0) / 4.0)
         return f
 
     @staticmethod
